@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Generated outputs
+output/
+*.stl
+*.obj
+*.blend
+*.blend1
+*.csv
+*.png
+*.pdf
+
+# Keep example STLs out of repo (large binary files)
+examples/*.stl
+examples/*.blend
+examples/*.obj
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
