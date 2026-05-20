@@ -43,47 +43,22 @@ _HOLDER_COLORS = {
 # OBJ export
 # ─────────────────────────────────────────────────────────────────────────────
 
-def holder_to_obj(holder, n_phi=120, n_x=80) -> str:
+def holder_to_obj(holder, n_phi=300, n_x=200) -> str:
     """Generate Wavefront OBJ text for a holder mesh (no MTL)."""
-    from .holder import _surface_to_triangles, _annulus_triangles
+    verts_mm, faces = _holder_mesh_data(holder, n_phi=n_phi, n_x=n_x, groove_scale=3.0)
 
     lines = [
         f"# Gradient coil holder [{holder.label}]",
         f"# R={holder.R:.1f}mm  OD={holder.R_outer*2:.1f}mm  length={holder.length:.0f}mm",
         "o holder_" + holder.label,
     ]
-
-    verts = []
-    faces = []
-    v_offset = 1  # OBJ is 1-indexed
-
-    def add_tris(triangles):
-        nonlocal v_offset
-        for tri in triangles:
-            for v in tri:
-                verts.append(v)
-            n = len(verts)
-            faces.append((n - 2, n - 1, n))   # 1-indexed, already offset
-
-    # Outer grooved surface
-    X, Y, Z, _ = holder.groove_surface(n_phi=n_phi, n_x=n_x)
-    add_tris(_surface_to_triangles(X, Y, Z, flip=False))
-
-    # Inner surface
-    phi_g = np.linspace(-np.pi, np.pi, n_phi)
-    x_g = np.linspace(-holder.x_half, holder.x_half, n_x)
-    PHI, XX = np.meshgrid(phi_g, x_g)
-    add_tris(_surface_to_triangles(XX, holder.R_inner * np.cos(PHI), holder.R_inner * np.sin(PHI), flip=True))
-
-    # End caps
-    for x_sign in [-1, 1]:
-        add_tris(_annulus_triangles(x_sign * holder.x_half, holder.R_inner, holder.R_outer, n_phi, flip=(x_sign > 0)))
-
-    for v in verts:
-        lines.append(f"v {v[0]:.5f} {v[1]:.5f} {v[2]:.5f}")
+    for v in verts_mm:
+        lines.append(f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}")
     for f in faces:
-        lines.append(f"f {f[0]} {f[1]} {f[2]}")
-
+        # OBJ is 1-indexed; quads → two triangles
+        a, b, c, d = [idx + 1 for idx in f]
+        lines.append(f"f {a} {b} {c}")
+        lines.append(f"f {a} {c} {d}")
     return "\n".join(lines) + "\n"
 
 
@@ -108,29 +83,153 @@ def save_all_obj(result, output_dir):
 # Blender Python script generation
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _grid_quads(nr, nc, flip=False):
+    """Return quad face list for an (nr × nc) vertex grid."""
+    faces = []
+    for i in range(nr - 1):
+        for j in range(nc - 1):
+            v00 = i * nc + j
+            v10 = (i + 1) * nc + j
+            v01 = i * nc + (j + 1)
+            v11 = (i + 1) * nc + (j + 1)
+            if not flip:
+                faces.append([v00, v10, v11, v01])
+            else:
+                faces.append([v00, v01, v11, v10])
+    return faces
+
+
+def _annulus_quads(x_pos, r_inner, r_outer, n_phi, flip=False):
+    """Vertex list + face list for a flat annulus at x_pos (mm)."""
+    phi = np.linspace(-np.pi, np.pi, n_phi, endpoint=False)
+    verts = []
+    for p in phi:
+        verts.append([x_pos, r_inner * np.cos(p), r_inner * np.sin(p)])
+    for p in phi:
+        verts.append([x_pos, r_outer * np.cos(p), r_outer * np.sin(p)])
+    faces = []
+    for i in range(n_phi):
+        ni = (i + 1) % n_phi
+        i_in, ni_in = i, ni
+        i_out, ni_out = i + n_phi, ni + n_phi
+        if not flip:
+            faces.append([i_in, ni_in, ni_out, i_out])
+        else:
+            faces.append([i_in, i_out, ni_out, ni_in])
+    return verts, faces
+
+
+def _band_quads(x0, x1, R, n_phi, flip=False):
+    """Axial band between two x positions at radius R (mm)."""
+    phi = np.linspace(-np.pi, np.pi, n_phi, endpoint=False)
+    verts = []
+    for p in phi:
+        verts.append([x0, R * np.cos(p), R * np.sin(p)])
+    for p in phi:
+        verts.append([x1, R * np.cos(p), R * np.sin(p)])
+    faces = []
+    for i in range(n_phi):
+        ni = (i + 1) % n_phi
+        if not flip:
+            faces.append([i, ni, ni + n_phi, i + n_phi])
+        else:
+            faces.append([i, i + n_phi, ni + n_phi, ni])
+    return verts, faces
+
+
+def _holder_mesh_data(holder, n_phi=300, n_x=200, groove_scale=3.0):
+    """Return (verts_mm, faces) for the full holder shell.
+
+    Mesh is built entirely in Python/numpy so it works inside Blender's
+    embedded Python without scipy or any external library.
+    """
+    all_verts = []
+    all_faces = []
+
+    def add(verts, faces):
+        offset = len(all_verts)
+        all_verts.extend(verts)
+        for f in faces:
+            all_faces.append([idx + offset for idx in f])
+
+    # ── Outer grooved surface ────────────────────────────────────────────────
+    X_o, Y_o, Z_o, _ = holder.groove_surface(n_phi=n_phi, n_x=n_x, groove_scale=groove_scale)
+    nr, nc = X_o.shape
+    outer_verts = np.round(
+        np.column_stack([X_o.ravel(), Y_o.ravel(), Z_o.ravel()]), 3
+    ).tolist()
+    add(outer_verts, _grid_quads(nr, nc, flip=False))
+
+    # ── Inner bore surface ───────────────────────────────────────────────────
+    phi_g = np.linspace(-np.pi, np.pi, n_phi)
+    x_g   = np.linspace(-holder.x_half, holder.x_half, n_x)
+    PHI, XX = np.meshgrid(phi_g, x_g)
+    inner_verts = np.round(np.column_stack([
+        XX.ravel(),
+        (holder.R_inner * np.cos(PHI)).ravel(),
+        (holder.R_inner * np.sin(PHI)).ravel(),
+    ]), 3).tolist()
+    add(inner_verts, _grid_quads(nr, nc, flip=True))
+
+    # ── End cap annuli ───────────────────────────────────────────────────────
+    for x_sign in (-1, 1):
+        v, f = _annulus_quads(
+            x_sign * holder.x_half, holder.R_inner, holder.R_outer,
+            n_phi, flip=(x_sign > 0)
+        )
+        add(v, f)
+
+    # ── Flanges ──────────────────────────────────────────────────────────────
+    if holder.flange_w > 0:
+        for x_sign in (-1, 1):
+            xb = holder.x_half
+            xf = holder.x_half + holder.flange_w
+            # Outer face of flange
+            v, f = _annulus_quads(
+                x_sign * xf, holder.R_inner, holder.R_flange,
+                n_phi, flip=(x_sign < 0)
+            )
+            add(v, f)
+            # Inner face of flange (ring between R_outer and R_flange)
+            v, f = _annulus_quads(
+                x_sign * xb, holder.R_outer, holder.R_flange,
+                n_phi, flip=(x_sign > 0)
+            )
+            add(v, f)
+            # Outer band of flange
+            v, f = _band_quads(
+                x_sign * xb, x_sign * xf, holder.R_flange,
+                n_phi, flip=(x_sign < 0)
+            )
+            add(v, f)
+
+    return all_verts, all_faces
+
+
 def generate_blender_script(result, output_blend_path=None) -> str:
     """Return a self-contained Python script to recreate the scene in Blender.
 
-    The script can be run via:
+    The script embeds pre-computed mesh data (vertices + quad faces) and wire
+    paths as JSON, then builds everything with bpy.data.meshes.from_pydata().
+    No external libraries or Blender import operators are needed.
+
+    Run via:
       blender --background --python script.py
-    Or pasted into Blender's Script Editor and executed.
+    or paste into Blender's Script Editor.
     """
-    # Serialise wire paths as a compact embedded dict (nested lists)
     coil_data = {}
     for lbl, info in result["coils"].items():
+        holder = info["holder"]
+        verts_mm, faces = _holder_mesh_data(holder, n_phi=300, n_x=200, groove_scale=3.0)
         coil_data[lbl] = {
-            "wires": [{"xyz": w["xyz"].tolist(), "level": w["level"]}
-                      for w in info["wires_3d"]],
-            "coil_radius_mm": info["coil_radius_mm"],
-            "holder": {
-                "R": info["holder"].R,
-                "R_inner": info["holder"].R_inner,
-                "R_outer": info["holder"].R_outer,
-                "x_half": info["holder"].x_half,
-                "flange_w": info["holder"].flange_w,
-                "flange_t": info["holder"].flange_t,
-            },
+            "wires": [
+                {"xyz": w["xyz"].tolist(), "level": float(w["level"])}
+                for w in info["wires_3d"]
+            ],
+            "holder_verts_mm": verts_mm,
+            "holder_faces": faces,
         }
+
     data_json = json.dumps(coil_data, separators=(",", ":"))
 
     output_line = ""
@@ -140,180 +239,130 @@ def generate_blender_script(result, output_blend_path=None) -> str:
 
     script = textwrap.dedent(f"""\
     # Gradient Coil Designer — Auto-generated Blender scene
+    # Coordinate convention: X = bore axis, Y = B0, Z = perpendicular
     # Run: blender --background --python <this_file>
     import bpy, json, math
-    import numpy as np
 
-    # ── 1. Scene reset ──────────────────────────────────────────────────────
+    # ── Scene reset ─────────────────────────────────────────────────────────
     bpy.ops.object.select_all(action='SELECT')
-    bpy.ops.object.delete()
-    for block in list(bpy.data.meshes) + list(bpy.data.curves) + list(bpy.data.materials):
-        try: bpy.data.meshes.remove(block) if hasattr(block,'vertices') else \
-             bpy.data.curves.remove(block) if hasattr(block,'splines') else \
-             bpy.data.materials.remove(block)
-        except: pass
+    bpy.ops.object.delete(use_global=False)
+    for d in (bpy.data.meshes, bpy.data.curves, bpy.data.materials):
+        for blk in list(d):
+            try: d.remove(blk)
+            except Exception: pass
 
-    # ── 2. Embedded coil data ───────────────────────────────────────────────
+    # ── Embedded data ────────────────────────────────────────────────────────
     COIL_DATA = json.loads({repr(data_json)})
 
     WIRE_COLORS = {{
-        "Gx": {{"pos": (0.9, 0.3, 0.05, 1.0), "neg": (0.2, 0.4, 0.9, 1.0)}},
-        "Gy": {{"pos": (0.05, 0.65, 0.15, 1.0), "neg": (0.6, 0.85, 0.1, 1.0)}},
-        "Gz": {{"pos": (0.9, 0.5, 0.0, 1.0),  "neg": (0.95, 0.8, 0.0, 1.0)}},
+        "Gx": {{"pos": (0.90, 0.25, 0.05), "neg": (0.20, 0.40, 0.90)}},
+        "Gy": {{"pos": (0.05, 0.65, 0.15), "neg": (0.55, 0.85, 0.10)}},
+        "Gz": {{"pos": (0.90, 0.50, 0.00), "neg": (0.95, 0.80, 0.00)}},
     }}
     HOLDER_COLORS = {{
-        "Gx": (1.0, 0.55, 0.0),
-        "Gy": (0.1, 0.65, 0.2),
-        "Gz": (0.15, 0.35, 0.9),
+        "Gx": (1.00, 0.55, 0.00),
+        "Gy": (0.10, 0.65, 0.20),
+        "Gz": (0.15, 0.35, 0.90),
     }}
 
-    def make_material(name, color, alpha=1.0):
+    # ── Helpers ──────────────────────────────────────────────────────────────
+    def make_mat(name, rgb, alpha=1.0, metallic=0.0, roughness=0.45):
         mat = bpy.data.materials.new(name)
         mat.use_nodes = True
-        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        nt = mat.node_tree
+        bsdf = nt.nodes.get("Principled BSDF")
         if bsdf:
-            bsdf.inputs["Base Color"].default_value = (*color, 1.0)
+            bsdf.inputs["Base Color"].default_value = (*rgb, 1.0)
             bsdf.inputs["Alpha"].default_value = alpha
-            bsdf.inputs["Metallic"].default_value = 0.8
-            bsdf.inputs["Roughness"].default_value = 0.2
-        mat.blend_method = "BLEND" if alpha < 1.0 else "OPAQUE"
+            bsdf.inputs["Metallic"].default_value = metallic
+            bsdf.inputs["Roughness"].default_value = roughness
+        if alpha < 1.0:
+            # Blender 4.2+: blend_method / shadow_method removed; use surface_render_method
+            if hasattr(mat, "surface_render_method"):
+                mat.surface_render_method = "BLENDED"
+            elif hasattr(mat, "blend_method"):
+                mat.blend_method = "BLEND"
         return mat
 
-    def add_curve_from_path(name, xyz_m, bevel_r_mm, mat, collection):
-        # xyz_m is in metres (from our data)
-        crv = bpy.data.curves.new(name, type="CURVE")
-        crv.dimensions = "3D"
-        crv.bevel_depth = bevel_r_mm * 1e-3
-        crv.bevel_resolution = 4
-        crv.fill_mode = "FULL"
-        sp = crv.splines.new("POLY")
-        sp.points.add(len(xyz_m) - 1)
-        for i, (x, y, z) in enumerate(xyz_m):
-            sp.points[i].co = (x, y, z, 1.0)
-        obj = bpy.data.objects.new(name, crv)
-        obj.data.materials.append(mat)
-        collection.objects.link(obj)
+    def build_mesh(name, verts_mm, faces, mat, col):
+        \"\"\"Create a shaded mesh object from mm vertices + poly face list.\"\"\"
+        mesh = bpy.data.meshes.new(name + "_mesh")
+        # Convert mm → metres
+        verts_m = [(v[0] * 0.001, v[1] * 0.001, v[2] * 0.001) for v in verts_mm]
+        mesh.from_pydata(verts_m, [], faces)
+        mesh.update()
+        # Smooth shading on every polygon
+        for poly in mesh.polygons:
+            poly.use_smooth = True
+        obj = bpy.data.objects.new(name, mesh)
+        if mat:
+            obj.data.materials.append(mat)
+        col.objects.link(obj)
         return obj
 
-    def add_cylinder_holder(label, R_inner, R_outer, x_half, flange_w, flange_t, mat, collection):
-        # Main cylinder shell via Boolean (solid cylinder minus inner bore)
-        # Use simple parametric approach: add_cylinder at OD, subtract ID bore
+    def add_wire(name, xyz_m, bevel_r_m, mat, col):
+        \"\"\"Add a POLY curve object with bevel for wire tube rendering.\"\"\"
+        crv = bpy.data.curves.new(name + "_crv", type="CURVE")
+        crv.dimensions    = "3D"
+        crv.bevel_depth   = bevel_r_m
+        crv.bevel_resolution = 4
+        crv.fill_mode     = "FULL"
+        sp = crv.splines.new("POLY")
+        sp.points.add(len(xyz_m) - 1)
+        for i, pt in enumerate(xyz_m):
+            sp.points[i].co = (pt[0], pt[1], pt[2], 1.0)
+        obj = bpy.data.objects.new(name, crv)
+        if mat:
+            obj.data.materials.append(mat)
+        col.objects.link(obj)
+        return obj
 
-        # Outer cylinder
-        bpy.ops.mesh.primitive_cylinder_add(
-            radius=R_outer*1e-3, depth=x_half*2*1e-3, location=(0,0,0),
-            vertices=64, end_fill_type='TRIFAN'
-        )
-        outer = bpy.context.active_object
-        outer.name = f"Holder_{{label}}_outer"
-
-        # Inner bore (cutter)
-        bpy.ops.mesh.primitive_cylinder_add(
-            radius=R_inner*1e-3, depth=x_half*2.1*1e-3, location=(0,0,0),
-            vertices=64, end_fill_type='TRIFAN'
-        )
-        inner = bpy.context.active_object
-        inner.name = f"Holder_{{label}}_bore"
-
-        # Boolean difference
-        mod = outer.modifiers.new("Bore", "BOOLEAN")
-        mod.operation = "DIFFERENCE"
-        mod.object = inner
-        bpy.context.view_layer.objects.active = outer
-        bpy.ops.object.modifier_apply(modifier="Bore")
-        bpy.data.objects.remove(inner, do_unlink=True)
-
-        outer.data.materials.append(mat)
-        collection.objects.link(outer)
-        try: bpy.context.scene.collection.objects.unlink(outer)
-        except: pass
-
-        # End flanges
-        if flange_w > 0:
-            for sign in (-1, 1):
-                x_pos = sign * (x_half + flange_w/2)
-                bpy.ops.mesh.primitive_cylinder_add(
-                    radius=(R_outer+flange_t)*1e-3,
-                    depth=flange_w*1e-3,
-                    location=(0, 0, x_pos*1e-3),
-                    vertices=64, end_fill_type='TRIFAN'
-                )
-                # Blender default: cylinder axis = Z; rotate to X axis
-                flange = bpy.context.active_object
-                flange.name = f"Flange_{{label}}_{{'+' if sign>0 else '-'}}"
-                # bore out inner
-                bpy.ops.mesh.primitive_cylinder_add(
-                    radius=R_inner*1e-3, depth=flange_w*1.1*1e-3,
-                    location=(0, 0, x_pos*1e-3), vertices=64
-                )
-                fcutter = bpy.context.active_object
-                bpy.context.view_layer.objects.active = flange
-                fmod = flange.modifiers.new("FBore","BOOLEAN")
-                fmod.operation = "DIFFERENCE"
-                fmod.object = fcutter
-                bpy.ops.object.modifier_apply(modifier="FBore")
-                bpy.data.objects.remove(fcutter, do_unlink=True)
-                flange.data.materials.append(mat)
-                collection.objects.link(flange)
-                try: bpy.context.scene.collection.objects.unlink(flange)
-                except: pass
-
-        return outer
-
-    # ── 3. Build scene ──────────────────────────────────────────────────────
-    # Note: Blender default is Z-up. Our data uses X=bore axis, Y=B0, Z=perp.
-    # We'll import as-is (rotate scene view in Blender if preferred).
-
-    scene_col = bpy.context.scene.collection
+    # ── Build scene ──────────────────────────────────────────────────────────
+    root = bpy.context.scene.collection
 
     for label, data in COIL_DATA.items():
-        wire_col = bpy.data.collections.new(f"{{label}}_Wires")
-        scene_col.children.link(wire_col)
-        holder_col = bpy.data.collections.new(f"{{label}}_Holder")
-        scene_col.children.link(holder_col)
+        wire_col = bpy.data.collections.new(label + "_Wires")
+        hold_col = bpy.data.collections.new(label + "_Holder")
+        root.children.link(wire_col)
+        root.children.link(hold_col)
 
-        cols = WIRE_COLORS[label]
-        wire_r_mm = 0.75   # visual wire tube radius
-
+        # Wire tubes
+        cols = WIRE_COLORS.get(label, {{"pos": (0.8,0.2,0.1), "neg": (0.2,0.3,0.8)}})
         for i, wd in enumerate(data["wires"]):
-            xyz = wd["xyz"]   # already in metres
-            level = wd["level"]
-            name = f"{{label}}_wire_{{i:02d}}"
-            color = cols["pos"][:3] if level > 0 else cols["neg"][:3]
-            mat = make_material(name + "_mat", color)
-            add_curve_from_path(name, xyz, wire_r_mm, mat, wire_col)
+            rgb = cols["pos"] if wd["level"] > 0 else cols["neg"]
+            mat = make_mat(f"{{label}}_w{{i}}_mat", rgb, metallic=0.85, roughness=0.15)
+            add_wire(f"{{label}}_wire_{{i:02d}}", wd["xyz"], 0.00075, mat, wire_col)
 
-        # Holder
-        h = data["holder"]
-        hcol = tuple(HOLDER_COLORS[label])
-        hmat = make_material(f"Holder_{{label}}_mat", hcol, alpha=0.45)
-        add_cylinder_holder(
-            label,
-            h["R_inner"], h["R_outer"], h["x_half"],
-            h["flange_w"], h["flange_t"],
-            hmat, holder_col
-        )
+        # Holder mesh (pre-computed grooved surface)
+        hrgb = HOLDER_COLORS.get(label, (0.5, 0.5, 0.5))
+        hmat = make_mat(label + "_holder_mat", hrgb, alpha=0.55, roughness=0.55)
+        build_mesh(label + "_holder", data["holder_verts_mm"], data["holder_faces"],
+                   hmat, hold_col)
 
-    # ── 4. Camera + lighting ────────────────────────────────────────────────
-    bpy.ops.object.camera_add(location=(0.4, -0.4, 0.3))
+    # ── Camera ───────────────────────────────────────────────────────────────
+    bpy.ops.object.camera_add(location=(0.45, -0.38, 0.28))
     cam = bpy.context.active_object
-    cam.rotation_euler = (math.radians(70), 0, math.radians(45))
+    cam.rotation_euler = (math.radians(68), 0, math.radians(46))
     bpy.context.scene.camera = cam
 
-    bpy.ops.object.light_add(type='SUN', location=(0.5, -0.5, 0.8))
+    # ── Lighting ─────────────────────────────────────────────────────────────
+    bpy.ops.object.light_add(type='SUN', location=(0.8, -0.6, 1.0))
     sun = bpy.context.active_object
-    sun.data.energy = 3.0
+    sun.data.energy = 4.0
+    sun.rotation_euler = (math.radians(40), 0, math.radians(25))
 
-    bpy.ops.object.light_add(type='AREA', location=(-0.3, 0.3, 0.5))
+    bpy.ops.object.light_add(type='AREA', location=(-0.4, 0.5, 0.6))
     area = bpy.context.active_object
-    area.data.energy = 200.0
+    area.data.energy = 600.0
+    area.data.size = 0.5
 
+    # ── Render settings ──────────────────────────────────────────────────────
     bpy.context.scene.render.engine = 'CYCLES'
-    bpy.context.scene.cycles.samples = 64
+    bpy.context.scene.cycles.samples = 128
 
     print("Gradient coil scene built successfully.")
 
-    # ── 5. Save ──────────────────────────────────────────────────────────────
+    # ── Save ─────────────────────────────────────────────────────────────────
     {output_line}
     """)
     return script
@@ -396,10 +445,10 @@ def export_blend(result, blend_path, blender_exe=None, timeout=120,
             [blender_exe, "--background", "--python", script_file],
             capture_output=True, text=True, timeout=timeout,
         )
-        if proc.returncode != 0:
+        if proc.returncode != 0 or "Traceback" in proc.stderr:
             raise RuntimeError(
-                f"Blender exited with code {proc.returncode}.\n"
-                f"stderr: {proc.stderr[-2000:]}"
+                f"Blender failed (exit {proc.returncode}).\n"
+                f"stderr:\n{proc.stderr[-3000:]}"
             )
         log(f"Blend file written: {blend_path}")
     finally:

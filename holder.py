@@ -161,9 +161,7 @@ class CoilHolder:
         """
         tri_arrays = []
 
-        # groove_scale=2.0: grooves are 2× wire radius deep — clearly visible in
-        # any STL viewer and still seats the wire correctly for 3D printing.
-        X_o, Y_o, Z_o, _ = self.groove_surface(n_phi=n_phi, n_x=n_x, groove_scale=2.0)
+        X_o, Y_o, Z_o, _ = self.groove_surface(n_phi=n_phi, n_x=n_x, groove_scale=3.0)
         tri_arrays.append(_surface_to_triangles(X_o, Y_o, Z_o, flip=False))
 
         # Inner surface (smooth)
