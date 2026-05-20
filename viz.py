@@ -334,7 +334,7 @@ def dashboard(designer_result, show=True, save_path=None):
 
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f'Dashboard saved → {save_path}')
+        print(f'Dashboard saved -> {save_path}')
     if show:
         plt.show()
     return fig

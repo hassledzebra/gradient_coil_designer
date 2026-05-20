@@ -104,7 +104,8 @@ class CoilHolder:
         depth_map : ndarray shape (n_x, n_phi)
             Groove depth at each surface point (0 = no groove).
         """
-        phi_grid = np.linspace(-np.pi, np.pi, n_phi)
+        # endpoint=False: n_phi unique angles, no duplicate seam vertex
+        phi_grid = np.linspace(-np.pi, np.pi, n_phi, endpoint=False)
         x_grid   = np.linspace(-self.x_half, self.x_half, n_x)
         PHI, XX  = np.meshgrid(phi_grid, x_grid)   # (n_x, n_phi)
 
@@ -137,6 +138,9 @@ class CoilHolder:
             depth_map = dm_flat.reshape(PHI.shape)
 
         R_surface = self.R_outer - depth_map
+        # Force boundary rows to exact R_outer so end-cap annuli seal flush
+        R_surface[0, :]  = self.R_outer
+        R_surface[-1, :] = self.R_outer
         X = XX
         Y = R_surface * np.cos(PHI)
         Z = R_surface * np.sin(PHI)
@@ -156,47 +160,63 @@ class CoilHolder:
     def to_stl_bytes(self, n_phi=1200, n_x=800, include_flanges=True):
         """Generate binary STL of the holder as bytes.
 
-        The mesh includes:
-          outer grooved surface, inner surface, two end caps, flanges.
+        Water-tight topology (every edge shared by exactly 2 triangles):
+
+        Without flanges:
+          outer grooved body  ←→  end caps (R_inner–R_outer)  ←→  inner bore
+
+        With flanges:
+          outer grooved body  ←→  step face (R_outer–R_flange) at ±x_half
+                                  flange OD band at R_flange
+                                  flange end face (R_inner–R_flange) at ±x_flange
+          inner bore (full length through flanges)  ←→  flange end face inner ring
         """
         tri_arrays = []
+        phi_g = np.linspace(-np.pi, np.pi, n_phi, endpoint=False)
+        has_flanges = include_flanges and self.flange_w > 0
+        x_flange = self.x_half + self.flange_w  # total half-length
 
+        # ── Outer grooved body (boundary rows forced to R_outer) ───────────
         X_o, Y_o, Z_o, _ = self.groove_surface(n_phi=n_phi, n_x=n_x, groove_scale=3.0)
         tri_arrays.append(_surface_to_triangles(X_o, Y_o, Z_o, flip=False))
 
-        # Inner surface (smooth)
-        phi_g = np.linspace(-np.pi, np.pi, n_phi)
-        x_g = np.linspace(-self.x_half, self.x_half, n_x)
-        PHI_i, XX_i = np.meshgrid(phi_g, x_g)
+        # ── Inner bore (extends to ±x_flange when flanges present) ─────────
+        x_inner_end = x_flange if has_flanges else self.x_half
+        PHI_i, XX_i = np.meshgrid(phi_g, np.linspace(-x_inner_end, x_inner_end, n_x))
         Y_i = self.R_inner * np.cos(PHI_i)
         Z_i = self.R_inner * np.sin(PHI_i)
         tri_arrays.append(_surface_to_triangles(XX_i, Y_i, Z_i, flip=True))
 
-        # End cap annuli (x = ±x_half)
-        for x_sign in [-1, 1]:
-            tri_arrays.append(_annulus_triangles(
-                x_sign * self.x_half, self.R_inner, self.R_outer, n_phi,
-                flip=(x_sign > 0)
-            ))
-
-        if include_flanges and self.flange_w > 0:
+        if not has_flanges:
+            # ── Simple end caps: R_inner → R_outer at ±x_half ──────────────
             for x_sign in [-1, 1]:
-                flange_x = x_sign * (self.x_half + self.flange_w)
-                face_x = x_sign * self.x_half
                 tri_arrays.append(_annulus_triangles(
-                    flange_x, self.R_inner, self.R_flange, n_phi,
-                    flip=(x_sign < 0)
+                    x_sign * self.x_half, self.R_inner, self.R_outer, n_phi,
+                    flip=(x_sign > 0)
                 ))
+        else:
+            for x_sign in [-1, 1]:
+                face_x = x_sign * self.x_half
+                flange_x = x_sign * x_flange
+
+                # Step face at ±x_half: R_outer → R_flange
+                # (no body end cap — inner bore passes through; outer body sealed here)
                 tri_arrays.append(_annulus_triangles(
                     face_x, self.R_outer, self.R_flange, n_phi,
                     flip=(x_sign > 0)
                 ))
-                phi_arr = np.linspace(-np.pi, np.pi, n_phi)
+                # Flange OD band at R_flange from face_x to flange_x
                 x_band = np.array([face_x, flange_x])
-                PHI_b, XX_b = np.meshgrid(phi_arr, x_band)
+                PHI_b, XX_b = np.meshgrid(phi_g, x_band)
                 Y_b = self.R_flange * np.cos(PHI_b)
                 Z_b = self.R_flange * np.sin(PHI_b)
-                tri_arrays.append(_surface_to_triangles(XX_b, Y_b, Z_b, flip=False))
+                tri_arrays.append(_surface_to_triangles(XX_b, Y_b, Z_b,
+                                                        flip=(x_sign < 0)))
+                # Flange end face at ±x_flange: R_inner → R_flange
+                tri_arrays.append(_annulus_triangles(
+                    flange_x, self.R_inner, self.R_flange, n_phi,
+                    flip=(x_sign < 0)
+                ))
 
         return _write_stl_binary(f"holder_{self.label}", tri_arrays)
 
@@ -226,20 +246,36 @@ class CoilHolder:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _surface_to_triangles(X, Y, Z, flip=False):
-    """Tessellate a 2D surface grid → (N, 3, 3) float32 triangle array."""
+    """Tessellate a cylindrical surface grid → (N, 3, 3) float32 triangle array.
+
+    Expects an endpoint=False phi grid (n_phi unique angles).  Adds a
+    wrap-around strip that connects the last phi column back to the first,
+    closing the cylinder and eliminating non-manifold seam edges.
+    """
+    # Interior strips: column j → j+1  (shape n_x-1, n_phi-1, 3)
     v00 = np.stack([X[:-1, :-1], Y[:-1, :-1], Z[:-1, :-1]], axis=-1)
     v10 = np.stack([X[1:,  :-1], Y[1:,  :-1], Z[1:,  :-1]], axis=-1)
     v01 = np.stack([X[:-1,  1:], Y[:-1,  1:], Z[:-1,  1:]], axis=-1)
     v11 = np.stack([X[1:,   1:], Y[1:,   1:], Z[1:,   1:]], axis=-1)
+    # Wrap-around strip: last column → first column  (shape n_x-1, 1, 3)
+    w00 = np.stack([X[:-1, -1:], Y[:-1, -1:], Z[:-1, -1:]], axis=-1)
+    w10 = np.stack([X[1:,  -1:], Y[1:,  -1:], Z[1:,  -1:]], axis=-1)
+    w01 = np.stack([X[:-1,  :1], Y[:-1,  :1], Z[:-1,  :1]], axis=-1)
+    w11 = np.stack([X[1:,   :1], Y[1:,   :1], Z[1:,   :1]], axis=-1)
     if not flip:
-        t1 = np.stack([v00, v10, v01], axis=2)
-        t2 = np.stack([v11, v01, v10], axis=2)
+        t1  = np.stack([v00, v10, v01], axis=2)
+        t2  = np.stack([v11, v01, v10], axis=2)
+        tw1 = np.stack([w00, w10, w01], axis=2)
+        tw2 = np.stack([w11, w01, w10], axis=2)
     else:
-        t1 = np.stack([v00, v01, v10], axis=2)
-        t2 = np.stack([v11, v10, v01], axis=2)
-    return np.concatenate(
-        [t1.reshape(-1, 3, 3), t2.reshape(-1, 3, 3)], axis=0
-    ).astype(np.float32)
+        t1  = np.stack([v00, v01, v10], axis=2)
+        t2  = np.stack([v11, v10, v01], axis=2)
+        tw1 = np.stack([w00, w01, w10], axis=2)
+        tw2 = np.stack([w11, w10, w01], axis=2)
+    return np.concatenate([
+        t1.reshape(-1, 3, 3),  t2.reshape(-1, 3, 3),
+        tw1.reshape(-1, 3, 3), tw2.reshape(-1, 3, 3),
+    ], axis=0).astype(np.float32)
 
 
 def _annulus_triangles(x_pos, r_inner, r_outer, n_phi, flip=False):

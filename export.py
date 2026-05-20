@@ -84,9 +84,14 @@ def save_all_obj(result, output_dir):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _grid_quads(nr, nc, flip=False):
-    """Return quad face list for an (nr × nc) vertex grid."""
+    """Return quad face list for an (nr × nc) vertex grid.
+
+    Adds a wrap-around column connecting the last phi column back to the
+    first, closing the cylinder.  Assumes endpoint=False phi grid.
+    """
     faces = []
     for i in range(nr - 1):
+        # Interior columns
         for j in range(nc - 1):
             v00 = i * nc + j
             v10 = (i + 1) * nc + j
@@ -96,11 +101,23 @@ def _grid_quads(nr, nc, flip=False):
                 faces.append([v00, v10, v11, v01])
             else:
                 faces.append([v00, v01, v11, v10])
+        # Wrap-around: last column → first column
+        v00 = i * nc + (nc - 1)
+        v10 = (i + 1) * nc + (nc - 1)
+        v01 = i * nc + 0
+        v11 = (i + 1) * nc + 0
+        if not flip:
+            faces.append([v00, v10, v11, v01])
+        else:
+            faces.append([v00, v01, v11, v10])
     return faces
 
 
 def _annulus_quads(x_pos, r_inner, r_outer, n_phi, flip=False):
-    """Vertex list + face list for a flat annulus at x_pos (mm)."""
+    """Vertex list + face list for a flat annulus at x_pos (mm).
+
+    Uses endpoint=False phi grid to match surface grids.
+    """
     phi = np.linspace(-np.pi, np.pi, n_phi, endpoint=False)
     verts = []
     for p in phi:
@@ -109,7 +126,7 @@ def _annulus_quads(x_pos, r_inner, r_outer, n_phi, flip=False):
         verts.append([x_pos, r_outer * np.cos(p), r_outer * np.sin(p)])
     faces = []
     for i in range(n_phi):
-        ni = (i + 1) % n_phi
+        ni = (i + 1) % n_phi   # wrap-around on last vertex
         i_in, ni_in = i, ni
         i_out, ni_out = i + n_phi, ni + n_phi
         if not flip:
@@ -120,7 +137,10 @@ def _annulus_quads(x_pos, r_inner, r_outer, n_phi, flip=False):
 
 
 def _band_quads(x0, x1, R, n_phi, flip=False):
-    """Axial band between two x positions at radius R (mm)."""
+    """Axial band between two x positions at radius R (mm).
+
+    Uses endpoint=False phi grid; wrap-around handled via modulo.
+    """
     phi = np.linspace(-np.pi, np.pi, n_phi, endpoint=False)
     verts = []
     for p in phi:
@@ -129,7 +149,7 @@ def _band_quads(x0, x1, R, n_phi, flip=False):
         verts.append([x1, R * np.cos(p), R * np.sin(p)])
     faces = []
     for i in range(n_phi):
-        ni = (i + 1) % n_phi
+        ni = (i + 1) % n_phi   # wrap-around
         if not flip:
             faces.append([i, ni, ni + n_phi, i + n_phi])
         else:
@@ -161,7 +181,7 @@ def _holder_mesh_data(holder, n_phi=300, n_x=200, groove_scale=3.0):
     add(outer_verts, _grid_quads(nr, nc, flip=False))
 
     # ── Inner bore surface ───────────────────────────────────────────────────
-    phi_g = np.linspace(-np.pi, np.pi, n_phi)
+    phi_g = np.linspace(-np.pi, np.pi, n_phi, endpoint=False)
     x_g   = np.linspace(-holder.x_half, holder.x_half, n_x)
     PHI, XX = np.meshgrid(phi_g, x_g)
     inner_verts = np.round(np.column_stack([
