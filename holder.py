@@ -177,15 +177,17 @@ class CoilHolder:
         x_flange = self.x_half + self.flange_w  # total half-length
 
         # ── Outer grooved body (boundary rows forced to R_outer) ───────────
+        # flip=True → normals point outward (+R), grooves appear recessed
         X_o, Y_o, Z_o, _ = self.groove_surface(n_phi=n_phi, n_x=n_x, groove_scale=3.0)
-        tri_arrays.append(_surface_to_triangles(X_o, Y_o, Z_o, flip=False))
+        tri_arrays.append(_surface_to_triangles(X_o, Y_o, Z_o, flip=True))
 
         # ── Inner bore (extends to ±x_flange when flanges present) ─────────
+        # flip=False → normals point inward (−R, toward bore axis)
         x_inner_end = x_flange if has_flanges else self.x_half
         PHI_i, XX_i = np.meshgrid(phi_g, np.linspace(-x_inner_end, x_inner_end, n_x))
         Y_i = self.R_inner * np.cos(PHI_i)
         Z_i = self.R_inner * np.sin(PHI_i)
-        tri_arrays.append(_surface_to_triangles(XX_i, Y_i, Z_i, flip=True))
+        tri_arrays.append(_surface_to_triangles(XX_i, Y_i, Z_i, flip=False))
 
         if not has_flanges:
             # ── Simple end caps: R_inner → R_outer at ±x_half ──────────────
@@ -200,22 +202,23 @@ class CoilHolder:
                 flange_x = x_sign * x_flange
 
                 # Step face at ±x_half: R_outer → R_flange
-                # (no body end cap — inner bore passes through; outer body sealed here)
                 tri_arrays.append(_annulus_triangles(
                     face_x, self.R_outer, self.R_flange, n_phi,
                     flip=(x_sign > 0)
                 ))
                 # Flange OD band at R_flange from face_x to flange_x
+                # flip=(x_sign > 0): x increases for right flange → outward +R normals
                 x_band = np.array([face_x, flange_x])
                 PHI_b, XX_b = np.meshgrid(phi_g, x_band)
                 Y_b = self.R_flange * np.cos(PHI_b)
                 Z_b = self.R_flange * np.sin(PHI_b)
                 tri_arrays.append(_surface_to_triangles(XX_b, Y_b, Z_b,
-                                                        flip=(x_sign < 0)))
+                                                        flip=(x_sign > 0)))
                 # Flange end face at ±x_flange: R_inner → R_flange
+                # flip=(x_sign > 0) → +X normal at +x_flange, −X at −x_flange
                 tri_arrays.append(_annulus_triangles(
                     flange_x, self.R_inner, self.R_flange, n_phi,
-                    flip=(x_sign < 0)
+                    flip=(x_sign > 0)
                 ))
 
         return _write_stl_binary(f"holder_{self.label}", tri_arrays)

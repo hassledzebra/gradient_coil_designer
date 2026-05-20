@@ -178,7 +178,7 @@ def _holder_mesh_data(holder, n_phi=300, n_x=200, groove_scale=3.0):
     outer_verts = np.round(
         np.column_stack([X_o.ravel(), Y_o.ravel(), Z_o.ravel()]), 3
     ).tolist()
-    add(outer_verts, _grid_quads(nr, nc, flip=False))
+    add(outer_verts, _grid_quads(nr, nc, flip=True))   # outward +R normals
 
     # ── Inner bore surface ───────────────────────────────────────────────────
     phi_g = np.linspace(-np.pi, np.pi, n_phi, endpoint=False)
@@ -189,7 +189,7 @@ def _holder_mesh_data(holder, n_phi=300, n_x=200, groove_scale=3.0):
         (holder.R_inner * np.cos(PHI)).ravel(),
         (holder.R_inner * np.sin(PHI)).ravel(),
     ]), 3).tolist()
-    add(inner_verts, _grid_quads(nr, nc, flip=True))
+    add(inner_verts, _grid_quads(nr, nc, flip=False))  # inward −R normals
 
     # ── End cap annuli ───────────────────────────────────────────────────────
     for x_sign in (-1, 1):
