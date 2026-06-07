@@ -45,7 +45,7 @@ _HOLDER_COLORS = {
 
 def holder_to_obj(holder, n_phi=300, n_x=200) -> str:
     """Generate Wavefront OBJ text for a holder mesh (no MTL)."""
-    verts_mm, faces = _holder_mesh_data(holder, n_phi=n_phi, n_x=n_x, groove_scale=3.0)
+    verts_mm, faces = _holder_mesh_data(holder, n_phi=n_phi, n_x=n_x, groove_scale=1.0)
 
     lines = [
         f"# Gradient coil holder [{holder.label}]",
@@ -157,7 +157,7 @@ def _band_quads(x0, x1, R, n_phi, flip=False):
     return verts, faces
 
 
-def _holder_mesh_data(holder, n_phi=300, n_x=200, groove_scale=3.0):
+def _holder_mesh_data(holder, n_phi=300, n_x=200, groove_scale=1.0):
     """Return (verts_mm, faces) for the full holder shell.
 
     Mesh is built entirely in Python/numpy so it works inside Blender's
@@ -240,7 +240,7 @@ def generate_blender_script(result, output_blend_path=None) -> str:
     coil_data = {}
     for lbl, info in result["coils"].items():
         holder = info["holder"]
-        verts_mm, faces = _holder_mesh_data(holder, n_phi=300, n_x=200, groove_scale=3.0)
+        verts_mm, faces = _holder_mesh_data(holder, n_phi=300, n_x=200, groove_scale=1.0)
         coil_data[lbl] = {
             "wires": [
                 {"xyz": w["xyz"].tolist(), "level": float(w["level"])}

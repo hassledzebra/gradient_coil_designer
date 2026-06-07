@@ -9,7 +9,7 @@ A universal Python toolkit for designing and fabricating MRI/NMR gradient coils 
 - **Target Field Method** stream-function computation for Gx, Gy, and Gz gradient axes
 - **Biot-Savart field verification** with linearity error reporting
 - **Concentric cylindrical holders** that stack inside each other — Gx (outermost) → Gy → Gz (innermost)
-- **Smooth recessed wire grooves** on the outer surface of each holder (KD-tree, vectorised)
+- **Smooth half-pipe wire grooves** carved on the outer surface as a radial displacement / KD-tree distance field (no booleans → watertight, no slivers). The wire seats at the coil radius and is cradled by the groove walls
 - **Interactive GUI** (CustomTkinter dark theme) with tabbed matplotlib visualisation
 - **PyVista 3D** interactive GPU-accelerated rendering (optional)
 - **Exports**: binary STL, OBJ, CSV wire paths, Blender script, `.blend` file (headless)
@@ -91,7 +91,7 @@ The GUI lets you adjust all design parameters, run the solver, inspect plots, an
 | Button | Output |
 |--------|--------|
 | Export CSV | Wire path coordinates for each axis |
-| Export STL | Binary STL of each holder (1200 × 800 mesh, 2 mm groove depth) |
+| Export STL | Binary STL of each holder (720 × 400 mesh; half-pipe groove sized to the wire) |
 | Export OBJ | Wavefront OBJ mesh of each holder |
 | Export Blender script | Self-contained `.py` that rebuilds the scene in Blender |
 | Generate .blend | Runs Blender headlessly and saves a `.blend` file directly |
@@ -129,9 +129,11 @@ Expected results (10 wires/quadrant):
 
 | Axis | R (mm) | OD (mm) | Efficiency | Linearity |
 |------|--------|---------|------------|-----------|
-| Gx   | 76.5   | 156     | ~3.9 mT/m/A | ~4 %    |
-| Gy   | 69.5   | 142     | ~3.0 mT/m/A | ~2 %    |
-| Gz   | 62.5   | 128     | ~3.8 mT/m/A | ~1 %    |
+| Gx   | 76.5   | 153     | ~3.9 mT/m/A | ~4 %    |
+| Gy   | 69.5   | 139     | ~3.0 mT/m/A | ~2 %    |
+| Gz   | 62.5   | 125     | ~3.8 mT/m/A | ~1 %    |
+
+(OD = 2 × land radius = 2 × (coil_radius + groove_clearance); flanges add `flange_thick_mm` beyond that.)
 
 ---
 
@@ -157,7 +159,7 @@ gradient_coil_designer/
 
 ## Physical Design Notes
 
-- **Groove depth**: 2 × (wire_radius + clearance) — wires sit flush and are held in place
+- **Groove profile**: a circular half-pipe of radius `wire_radius + clearance`, carved as a radial displacement that hugs the round wire (depth = that radius). Wire paths are arc-length resampled below the groove radius so channels stay continuous regardless of TFM contour spacing. The land sits just above the wire centerline, so the wire seats at the coil radius and is captured by the groove walls
 - **Layer stacking**: each inner holder clears the previous by `layer_gap_mm` radially
 - **End flanges**: extend axially beyond the coil for alignment and retention
 - **STL units**: millimetres (import into slicer at 1:1 scale)

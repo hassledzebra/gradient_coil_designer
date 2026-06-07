@@ -98,7 +98,7 @@ def plot_holder_3d(holder, ax=None, axis_label='', alpha=0.55, wire_lw=1.0):
 
     # Grooved outer surface (mm → cm)
     if holder._wire_paths_phi_x:
-        X_g, Y_g, Z_g, _ = holder.groove_surface(n_phi=1200, n_x=800, groove_scale=3.0)
+        X_g, Y_g, Z_g, _ = holder.groove_surface(n_phi=1200, n_x=800, groove_scale=1.0)
         ax.plot_surface(X_g / 10, Y_g / 10, Z_g / 10,
                         alpha=alpha, color=col, linewidth=0, antialiased=True,
                         rcount=800, ccount=1200)
@@ -125,7 +125,7 @@ def plot_holder_3d(holder, ax=None, axis_label='', alpha=0.55, wire_lw=1.0):
     for k, (x_arr, phi_arr) in enumerate(holder.groove_path_on_surface()):
         col_w = pos_col if k % 4 < 2 else neg_col
         x_cm = x_arr / 10.0
-        Rg_cm = (holder.R_outer - holder.groove_radius * 3.0) / 10.0
+        Rg_cm = (holder.R_outer - holder.groove_radius) / 10.0   # half-pipe floor
         y_cm = Rg_cm * np.cos(phi_arr)
         z_cm = Rg_cm * np.sin(phi_arr)
         ax.plot(x_cm, y_cm, z_cm, color=col_w, lw=wire_lw, alpha=0.9)

@@ -58,7 +58,7 @@ def _wire_to_tube(xyz_m, tube_radius_m=0.0007):
 def _holder_to_pv(holder, n_phi=1200, n_x=800, with_grooves=True):
     """Build pyvista PolyData for the holder outer surface (with/without grooves)."""
     if with_grooves and holder._wire_paths_phi_x:
-        X, Y, Z, _ = holder.groove_surface(n_phi=n_phi, n_x=n_x, groove_scale=3.0)
+        X, Y, Z, _ = holder.groove_surface(n_phi=n_phi, n_x=n_x, groove_scale=1.0)
     else:
         phi = np.linspace(-np.pi, np.pi, n_phi)
         x = np.linspace(-holder.x_half, holder.x_half, n_x)
