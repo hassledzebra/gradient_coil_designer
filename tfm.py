@@ -113,6 +113,11 @@ def _close_axial_ends(streamF, taper_frac=0.04, label=''):
 
     A warning is raised when a lot of psi is being thrown away, which means the
     computation domain is too short for the requested linear region.
+
+    ``taper_frac`` is the width of each taper as a fraction of the coil length.
+    Every turn whose current is cut off at the end has to return inside that
+    band, so a narrow band packs those turns closer together than a wire is
+    wide.  The designer widens it until the wires fit (``auto_fit``).
     """
     n = streamF.shape[0]
     peak = np.abs(streamF).max()
@@ -166,14 +171,17 @@ def compute_contour_paths(streamF, num_wires, phi, z):
             if len(seg) > 5:
                 wire_paths.append((float(level), np.array(seg)))
 
-    # Keep only the longest paths when there are too many short fragments
+    # Keep only the longest paths when there are too many short fragments.
+    # Loops of the same length (mirror images of each other) are kept or dropped
+    # together: cutting the list at exactly 4*n used to keep a small innermost
+    # loop in some lobes and drop its mirror image in others, which left the two
+    # ends of a Gx coil with different numbers of turns.
     expected = num_wires * 4
     if len(wire_paths) > expected:
-        wire_paths.sort(
-            key=lambda item: float(np.sum(np.linalg.norm(np.diff(item[1], axis=0), axis=1))),
-            reverse=True,
-        )
-        wire_paths = wire_paths[:expected]
+        length = lambda item: float(np.sum(np.linalg.norm(np.diff(item[1], axis=0), axis=1)))
+        wire_paths.sort(key=length, reverse=True)
+        cut = 0.98 * length(wire_paths[expected - 1])
+        wire_paths = [w for w in wire_paths if length(w) >= cut]
 
     plt.close(fig_tmp)
     plt.ion()
@@ -194,6 +202,7 @@ def compute_gx_stream(
     apodization=0.015,
     resolution=1e-3,
     pad_factor=4.0,
+    taper_frac=0.04,
 ):
     """Gx (dBy/dx) stream function — axial saddle, cos(phi) symmetry."""
     a = coil_radius_mm * 1e-3
@@ -233,7 +242,7 @@ def compute_gx_stream(
     keep = np.abs(z) <= Zmax
     streamF = streamF[keep]
     z = z[keep]
-    streamF = _close_axial_ends(streamF, label='Gx')
+    streamF = _close_axial_ends(streamF, taper_frac=taper_frac, label='Gx')
 
     return compute_contour_paths(streamF, num_wires, phi, z)
 
@@ -246,6 +255,8 @@ def compute_gy_stream(
     linearity_order=16,
     apodization=0.015,
     resolution=1e-3,
+    taper_frac=0.04,
+    crop_factor=1.5,
 ):
     """Gy (dBy/dy) stream function — 45°-rotated quadrupole, cos(2*phi) symmetry."""
     a = coil_radius_mm * 1e-3
@@ -269,12 +280,17 @@ def compute_gy_stream(
     B_apo = np.fft.ifft((2 / np.pi) * (-1) * n_0 * t_k / k)
     streamF = np.outer(np.real(B_apo), np.cos(2 * phi))
 
+    # The wire pattern is kept out to +/- crop_factor * d.  1.5 cuts the turns
+    # off where the stream function is still large, and they all have to return
+    # inside the end taper; a larger value (when the former is long enough)
+    # gives them more length to return over.
     d_samp = d / resolution
-    i_lo = int(Nsamp / 2 - 1.5 * d_samp)
-    i_hi = int(Nsamp / 2 + 1.5 * d_samp)
+    crop = min(float(crop_factor), 0.98 * Zmax / d)
+    i_lo = int(Nsamp / 2 - crop * d_samp)
+    i_hi = int(Nsamp / 2 + crop * d_samp)
     streamF = streamF[i_lo:i_hi]
     z = z[i_lo:i_hi]
-    streamF = _close_axial_ends(streamF, label='Gy')
+    streamF = _close_axial_ends(streamF, taper_frac=taper_frac, label='Gy')
 
     return compute_contour_paths(streamF, num_wires, phi, z)
 
@@ -287,6 +303,8 @@ def compute_gz_stream(
     linearity_order=16,
     apodization=0.015,
     resolution=1e-3,
+    taper_frac=0.04,
+    crop_factor=1.5,
 ):
     """Gz (dBy/dz) stream function — quadrupole, sin(2*phi) symmetry."""
     a = coil_radius_mm * 1e-3
@@ -310,12 +328,17 @@ def compute_gz_stream(
     B_apo = np.fft.ifft((2 / np.pi) * (-1) * n_0 * t_k / k)
     streamF = np.outer(np.real(B_apo), np.sin(2 * phi))
 
+    # The wire pattern is kept out to +/- crop_factor * d.  1.5 cuts the turns
+    # off where the stream function is still large, and they all have to return
+    # inside the end taper; a larger value (when the former is long enough)
+    # gives them more length to return over.
     d_samp = d / resolution
-    i_lo = int(Nsamp / 2 - 1.5 * d_samp)
-    i_hi = int(Nsamp / 2 + 1.5 * d_samp)
+    crop = min(float(crop_factor), 0.98 * Zmax / d)
+    i_lo = int(Nsamp / 2 - crop * d_samp)
+    i_hi = int(Nsamp / 2 + crop * d_samp)
     streamF = streamF[i_lo:i_hi]
     z = z[i_lo:i_hi]
-    streamF = _close_axial_ends(streamF, label='Gz')
+    streamF = _close_axial_ends(streamF, taper_frac=taper_frac, label='Gz')
 
     return compute_contour_paths(streamF, num_wires, phi, z)
 

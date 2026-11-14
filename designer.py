@@ -24,6 +24,7 @@ import numpy as np
 from . import tfm
 from .holder import CoilHolder
 from . import physics as phys
+from . import winding as wd
 
 
 class GradientCoilDesigner:
@@ -79,6 +80,45 @@ class GradientCoilDesigner:
     dsv_radius_mm : float or None
         Radius of the sphere over which gradient efficiency and linearity are
         scored.  Defaults to ``linear_region_mm``.
+    winding : 'spiral' or 'loops'
+        'spiral' (default): the loops are joined into a route one wire can
+        follow without leaving a groove (see ``winding.py``): one spiral per
+        lobe, a lead-in channel one wire deeper that passes under the turns,
+        jumper grooves between lobes, and a flange notch for each wire tail.
+        Gx becomes two wires (one per end), Gy and Gz one wire each.  The
+        field check, wire length and CSV export then use the route, i.e. the
+        coil as it will be wound.  'loops': one closed ring groove per contour,
+        the earlier behaviour.
+    auto_fit : bool
+        True (default): the designer changes what it must so that every holder
+        comes out with grooves a wire can follow, and says what it changed
+        (printed, in ``result['coils'][axis]['adjustments']`` and in the JSON
+        summary).  In this order:
+          - wall: with winding='spiral' a wall too thin for the lead-in channel
+            is raised to 1.5 * wire + 2 * clearance + 0.9 mm;
+          - coil ends: where turns that are cut off at the end of the coil
+            return closer together than a wire needs (wire + clearance), Gy and
+            Gz first use spare holder length for the return, which keeps the
+            field; then the band the turns return in is widened inward, up to
+            30 % of the coil length (costs up to about 20 % of the gradient
+            strength and 2 points of linearity); a Gy / Gz pattern longer than
+            the holder is cut to fit it;
+          - stray slivers and small secondary lobes that the route cannot reach
+            are left out;
+          - Gx coil length: shortened when the jumper grooves have no room
+            beyond the loops;
+          - turns: only if turns are still too close (for instance at the
+            middle of a dense Gx), or the loops cannot be joined into a route,
+            the number of turns per quadrant is reduced one at a time for that
+            axis.  This lowers the gradient per ampere in proportion.
+        False: nothing is changed; turns that are too close give a warning and
+        an impossible route raises ``winding.RouteError``.
+    stream_resolution_mm : float
+        Grid spacing of the stream function, both along the axis and round the
+        circumference (mm).  The wire contours are traced on this grid.  The
+        default of 1.0 is fine for a first look; on coils under about 50 mm
+        radius it moves the contours by up to 0.6-0.7 mm compared with a
+        0.25 mm grid, so use 0.25-0.5 for a holder you intend to print.
     verify_half_range_mm : float
         Sampling half-range for Biot-Savart profile (mm).
     verify_n_pts : int
@@ -105,6 +145,9 @@ class GradientCoilDesigner:
         dsv_radius_mm: float = None,
         verify_half_range_mm: float = 30.0,
         verify_n_pts: int = 21,
+        stream_resolution_mm: float = 1.0,
+        winding: str = 'spiral',
+        auto_fit: bool = True,
     ):
         self.bore_radius = bore_radius_mm
         self.linear_region = linear_region_mm
@@ -125,6 +168,21 @@ class GradientCoilDesigner:
                            else dsv_radius_mm)
         self.verify_range = verify_half_range_mm
         self.verify_n_pts = verify_n_pts
+        if not stream_resolution_mm > 0:
+            raise ValueError('stream_resolution_mm must be positive')
+        self.stream_resolution = stream_resolution_mm
+        if winding not in ('loops', 'spiral'):
+            raise ValueError("winding must be 'loops' or 'spiral'")
+        self.winding = winding
+        self.auto_fit = bool(auto_fit)
+        self.adjustments = []
+        if winding == 'spiral' and self.auto_fit:
+            st = wd.RouteSettings(wire_diameter_mm, groove_clearance_mm)
+            need = float(np.ceil((st.groove_radius + st.deep + 0.8) * 10 - 1e-6) / 10)
+            if self.wall < need - 1e-9:
+                self.adjustments.append(
+                    f'wall raised from {self.wall:.2f} to {need:.2f} mm for the lead-in channel')
+                self.wall = need
 
         # Compute coil radii based on bore, stacking from outside in
         # Stack order: Gx (outermost) -> Gy -> Gz (innermost)
@@ -157,7 +215,11 @@ class GradientCoilDesigner:
         Returns
         -------
         dict with keys:
-          'wires_3d'          -- list of wire dicts (from tfm.wire_paths_to_3d)
+          'wires_3d'          -- list of wire dicts: the closed loops, or with
+                                 winding='spiral' the routed wires
+          'loops_3d'          -- the closed loops (always)
+          'routes'            -- winding routes (winding='spiral'), else None
+          'min_loop_spacing_mm' -- closest approach of two loops (inf if > 4 mm)
           'contour_set'       -- raw matplotlib contour object
           'coil_radius_mm'    -- radius used
           'efficiency_mT_m_A' -- gradient efficiency from the 3-D DSV fit
@@ -169,32 +231,17 @@ class GradientCoilDesigner:
           'profile'           -- Biot-Savart profile dict (if verify_field=True)
           'holder'            -- CoilHolder instance
         """
+        if axis not in ('Gx', 'Gy', 'Gz'):
+            raise ValueError(f'Unknown axis: {axis!r}. Use Gx, Gy, or Gz.')
         R = self._coil_radii[axis]
-        coil_len = self._coil_length_mm(axis)
-        common = dict(
-            coil_radius_mm=R,
-            linear_region_mm=self.linear_region,
-            coil_length_mm=coil_len,
-            num_wires=self.n_wires,
-            linearity_order=self.linearity_order,
-            apodization=self.apodization,
-        )
-
         print(f'  Computing {axis} (R={R:.1f}mm, linear={self.linear_region}mm)...',
               end='', flush=True)
 
-        if axis == 'Gx':
-            wire_paths, cs = tfm.compute_gx_stream(
-                **common, num_high_orders=self.n_high_orders
-            )
-        elif axis == 'Gy':
-            wire_paths, cs = tfm.compute_gy_stream(**common)
-        elif axis == 'Gz':
-            wire_paths, cs = tfm.compute_gz_stream(**common)
-        else:
-            raise ValueError(f'Unknown axis: {axis!r}. Use Gx, Gy, or Gz.')
+        fit = self._fit_axis(axis, R)
+        wire_paths, cs, routes = fit['wire_paths'], fit['cs'], fit['routes']
+        n_open, spacing, notes = fit['n_open'], fit['spacing'], fit['notes']
+        pitch = self.min_pitch_mm()
 
-        n_open = tfm.open_path_count(wire_paths)
         if n_open:
             warnings.warn(
                 f'{axis}: {n_open} of {len(wire_paths)} contours do not close. '
@@ -202,14 +249,27 @@ class GradientCoilDesigner:
                 f'below are not trustworthy.',
                 RuntimeWarning, stacklevel=2,
             )
+        # Design rule: two turns need a wire and a clearance between their centres.
+        if spacing < pitch:
+            warnings.warn(
+                f'{axis}: two loops come within {spacing:.2f} mm of each other, less than '
+                f'the {pitch:.2f} mm a {self.wire_d} mm wire needs, so their grooves merge '
+                f'there and the wires cannot lie side by side. Use fewer wires, a thinner '
+                f'wire or a longer coil (auto_fit=True does this for you).',
+                RuntimeWarning, stacklevel=2,
+            )
 
-        wires_3d = tfm.wire_paths_to_3d(wire_paths, R)
+        loops_3d = tfm.wire_paths_to_3d(wire_paths, R)
         i_turn = tfm.amperes_per_turn(cs)
+        ext = tfm.wire_axial_extent_mm(loops_3d)
+        wires_3d = wd.route_to_wires_3d(routes, R) if routes else loops_3d
         wl = tfm.wire_length_m(wires_3d)
-        ext = tfm.wire_axial_extent_mm(wires_3d)
 
-        print(f' {len(wires_3d)} loops, +/-{max(abs(ext[0]),abs(ext[1])):.0f}mm extent',
+        joined = f' joined into {len(routes)} wire(s)' if routes else ''
+        print(f' {len(loops_3d)} loops{joined}, +/-{max(abs(ext[0]),abs(ext[1])):.0f}mm extent',
               flush=True)
+        for note in notes:
+            print(f'    adjusted: {note}', flush=True)
 
         # Build holder
         holder = CoilHolder(
@@ -222,7 +282,10 @@ class GradientCoilDesigner:
             groove_clearance_mm=self.groove_clearance,
             label=axis,
         )
-        holder.add_wire_paths(wires_3d)
+        if routes:
+            holder.add_route(routes)
+        else:
+            holder.add_wire_paths(wires_3d)
 
         # Biot-Savart verification
         # Symmetry rules (B0=Y, bore=X):
@@ -265,6 +328,11 @@ class GradientCoilDesigner:
 
         return {
             'wires_3d': wires_3d,
+            'loops_3d': loops_3d,
+            'routes': routes,
+            'min_loop_spacing_mm': spacing,
+            'n_wires_used': fit['n_wires'],
+            'adjustments': list(self.adjustments) + notes,
             'contour_set': cs,
             'coil_radius_mm': R,
             'efficiency_mT_m_A': (dsv['efficiency_mT_m_A'] if dsv else float('nan')),
@@ -276,6 +344,190 @@ class GradientCoilDesigner:
             'profile': profile,
             'holder': holder,
         }
+
+    def min_pitch_mm(self):
+        """Closest two turns may lie: a wire and one clearance.  Their grooves
+        then overlap by one clearance and a ridge is left between the wires."""
+        return self.wire_d + self.groove_clearance
+
+    def _contours(self, axis, R, coil_len, n_wires, crop, taper):
+        common = dict(
+            coil_radius_mm=R,
+            linear_region_mm=self.linear_region,
+            coil_length_mm=coil_len,
+            num_wires=n_wires,
+            linearity_order=self.linearity_order,
+            apodization=self.apodization,
+            resolution=self.stream_resolution * 1e-3,
+            taper_frac=taper,
+        )
+        if axis == 'Gx':
+            return tfm.compute_gx_stream(**common, num_high_orders=self.n_high_orders)
+        if axis == 'Gy':
+            return tfm.compute_gy_stream(**common, crop_factor=crop)
+        return tfm.compute_gz_stream(**common, crop_factor=crop)
+
+    # End-taper widths tried after the plain 4 %, as fractions of the coil length.
+    # A wider taper lets the cut-off turns return further apart.  It costs some
+    # gradient strength and a little linearity (about 20 % and 2 points at
+    # 30 %), which is far less than giving up turns costs.
+    _TAPERS = (0.07, 0.10, 0.15, 0.20, 0.25, 0.30)
+
+    def _end_stages(self, axis, st):
+        """Ways of closing the turns at the ends of the coil, mildest first, as
+        (crop_factor, taper_frac, description).  The first is the plain design.
+
+        Gy and Gz are cut off at 1.5 x the linear region, where the stream
+        function is still large, so many turns have to return in the end
+        taper.  If the former is longer than that, the pattern is kept further
+        out and the taper covers the added length: the turns return over a
+        wider band and nothing else about the design changes.  After that
+        (and for Gx from the start) the taper is widened inward.  If the former
+        is shorter than the pattern, the pattern is cut to fit it.
+        """
+        d = self.linear_region
+        if axis == 'Gx':
+            return [(1.5, 0.04, '')] + [(1.5, t, f'end taper widened to {t*100:.0f} % of the coil length')
+                                        for t in self._TAPERS]
+        reach = self.holder_length / 2 - (st.m2 + st.groove_radius + st.end_land + 0.5)
+        c_max = min(reach / d, 0.98 * 2 * self._coil_length_mm(axis) / d)
+        band = lambda c: (c - 1.44) / (2 * c)
+        if c_max < 1.5:
+            c = max(c_max, 0.3)
+            fit = f'pattern cut to +/-{c * d:.0f} mm to fit the holder (the design asks for +/-{1.5 * d:.0f} mm)'
+            return [(c, 0.04, fit)] + [(c, t, fit + f'; end taper widened to {t*100:.0f} % of the coil length')
+                                        for t in self._TAPERS]
+        stages = [(1.5, 0.04, '')]
+        crops = sorted({min(c, c_max) for c in (1.75, 2.0, 2.5, 3.0)}) if c_max >= 1.6 else []
+        for c in crops:
+            stages.append((c, band(c), f'turns return over +/-{c * d:.0f} mm instead of +/-{1.5 * d:.0f} mm'))
+        for c in ([crops[0], crops[-1]] if len(crops) > 1 else crops or [1.5]):
+            t0 = band(c) if crops else 0.04
+            for extra in (0.03, 0.06, 0.11, 0.16, 0.21):
+                if t0 + extra > 0.36:
+                    continue
+                note = f'end taper widened to {(t0 + extra)*100:.0f} % of the coil length'
+                if crops:
+                    note = f'turns return over +/-{c * d:.0f} mm; ' + note
+                stages.append((c, t0 + extra, note))
+        return stages
+
+    def _try(self, axis, R, st, n_w, stage, coil_len):
+        """One candidate design.  Returns (design dict, problem) where problem is
+        None, or (kind, text) with kind 'ends' (another way of closing the ends
+        may help), 'middle' (only fewer turns can help) or 'length' (Gx: text
+        is how much to shorten the coil by)."""
+        crop, taper, _ = stage
+        pitch = self.min_pitch_mm()
+        wire_paths, cs = self._contours(axis, R, coil_len, n_w, crop, taper)
+        n_open = tfm.open_path_count(wire_paths)
+        n_stray = 0
+        if self.auto_fit and not n_open:
+            wire_paths, n_stray = wd.drop_stray_loops(wire_paths, R)
+        spacing, where = ((float('nan'), 0.0) if n_open or not wire_paths
+                          else wd.loop_spacing_mm(wire_paths, R, where=True))
+        out = dict(wire_paths=wire_paths, cs=cs, routes=None, n_open=n_open, spacing=spacing,
+                   n_wires=n_w, crop=crop, taper=taper, coil_length_mm=coil_len, n_stray=n_stray,
+                   n_stacked=0)
+        if not wire_paths:
+            return out, ('middle', 'no loops were found')
+        if n_open:
+            return out, (('ends', f'{n_open} loops did not close') if self.auto_fit else None)
+        if self.auto_fit and spacing < pitch:
+            x_far = max(np.abs(p_[:, 1]).max() for _, p_ in wire_paths) * 1e3
+            if abs(where) > 0.7 * x_far:
+                return out, ('ends', f'turns were {spacing:.2f} mm apart at the end of the coil')
+            return out, ('middle', f'turns were {spacing:.2f} mm apart near the middle of the coil')
+        if self.winding != 'spiral':
+            return out, None
+        floor = self.wall - (st.groove_radius + st.deep)
+        if floor < 0.8 - 1e-6:
+            raise wd.RouteError(
+                f'{axis}: the lead-in channel is {st.groove_radius + st.deep:.2f} mm deep and the '
+                f'wall is {self.wall:.2f} mm, which leaves {floor:.2f} mm under it. Use a wall of at '
+                f'least {np.ceil((st.groove_radius + st.deep + 0.8) * 10 - 1e-6) / 10:.1f} mm for '
+                f'winding="spiral".', kind='wall')
+        try:
+            if self.auto_fit:
+                wire_paths, out['n_stacked'] = wd.drop_stacked_lobes(wire_paths, R, self.holder_length)
+                if out['n_stacked']:
+                    out['wire_paths'] = wire_paths
+                    out['spacing'] = spacing = wd.loop_spacing_mm(wire_paths, R)
+            routes = wd.plan_route(wire_paths, R, self.holder_length, self.flange_w,
+                                   self.wire_d, self.groove_clearance, settings=st)
+            gap, touching = wd.route_clearance(routes, R, st)
+            if touching or gap < min(spacing, pitch) - 0.1:
+                raise wd.RouteError(f'the wire would come within {gap:.2f} mm of itself', kind='topology')
+        except wd.RouteError as e:
+            if not self.auto_fit:
+                raise
+            out['error'] = e
+            if e.kind == 'room' and axis == 'Gx':
+                return out, ('length', e.shortfall_mm / 2 + 0.5)
+            if e.kind in ('room', 'topology'):
+                return out, ('ends', str(e).split(';')[0])
+            raise
+        out['routes'] = routes
+        return out, None
+
+    def _fit_axis(self, axis, R):
+        """Contours and winding route for one axis.
+
+        With ``auto_fit`` the design is adjusted until every turn has room for
+        its wire and (winding='spiral') the loops can be joined into a route
+        that never comes too close to itself.  For the number of turns asked
+        for, every way of closing the coil ends is tried, mildest first; only
+        if none works is one turn per quadrant given up and the search
+        repeated.  Each change is recorded in 'notes'.
+        """
+        st = wd.RouteSettings(self.wire_d, self.groove_clearance)
+        x_half = self.holder_length / 2
+        coil_len0 = self._coil_length_mm(axis)
+        stages = self._end_stages(axis, st)
+        if not self.auto_fit:
+            stages = stages[:1] if stages[0][0] == 1.5 else [(1.5, 0.04, '')]
+        found, reason, last_error = None, '', None
+
+        for n_w in range(int(self.n_wires), 0, -1):
+            for k, stage in enumerate(stages):
+                coil_len = coil_len0
+                for _ in range(6):                       # Gx: shorten the coil until the jumpers fit
+                    out, problem = self._try(axis, R, st, n_w, stage, coil_len)
+                    if problem and problem[0] == 'length' and coil_len - problem[1] > 0.55 * x_half:
+                        coil_len -= problem[1]
+                        continue
+                    break
+                last_error = out.get('error', last_error)
+                if problem is None or not self.auto_fit:
+                    found = (out, k)
+                    break
+                reason = problem[1] if isinstance(problem[1], str) else 'there was no room for the jumper grooves'
+                if problem[0] == 'middle':
+                    break                                # closing the ends differently cannot help
+            if found:
+                break
+        if not found:
+            if last_error is not None:
+                raise last_error
+            raise wd.RouteError(f'{axis}: no number of turns gives grooves that fit; use a thinner wire '
+                                f'or a larger former ({reason})')
+
+        out, k = found
+        notes = []
+        if out['n_wires'] != self.n_wires:
+            notes.append(f'turns per quadrant {self.n_wires} -> {out["n_wires"]} ({reason})')
+        if stages[k][2]:
+            notes.append(stages[k][2])
+        if out['n_stray']:
+            notes.append(f'{out["n_stray"]} small stray loop(s) left out')
+        if out['n_stacked']:
+            notes.append(f'{out["n_stacked"]} turn(s) in small lobes beyond the main lobes left out '
+                         f'(the route cannot reach them)')
+        if out['coil_length_mm'] != coil_len0:
+            notes.append(f'Gx coil shortened by {2 * (coil_len0 - out["coil_length_mm"]):.1f} mm '
+                         f'to make room for the jumper grooves')
+        out['notes'] = notes
+        return out
 
     def run(self, axes=None):
         """Design all requested gradient axes.
@@ -303,6 +555,9 @@ class GradientCoilDesigner:
         print(f'  Wire diameter:    {self.wire_d} mm')
         print(f'  Wall / Gap:       {self.wall} / {self.gap} mm')
         print(f'  Wires/quadrant:   {self.n_wires}')
+        print(f'  Winding:          {"one wire per lobe group (spiral)" if self.winding == "spiral" else "closed loops"}')
+        for note in self.adjustments:
+            print(f'  Adjusted:         {note}')
         print()
 
         coils = {}
@@ -412,6 +667,11 @@ class GradientCoilDesigner:
                 'open_paths': info.get('open_paths'),
                 'dsv': info.get('dsv'),
                 'wire_length_m': info['wire_length_m'],
+                'min_loop_spacing_mm': (None if not np.isfinite(info.get('min_loop_spacing_mm', np.nan))
+                                        else info['min_loop_spacing_mm']),
+                'wire_tails': info['holder'].tails(),
+                'turns_per_quadrant': info.get('n_wires_used'),
+                'adjustments': info.get('adjustments', []),
                 'axial_extent_mm': list(info['axial_extent_mm']),
                 'gradient_mT_m_A_BS': profile['gradient_mT_m_A'] if profile else None,
                 'linearity_pct': profile['linearity_pct'] if profile else None,
@@ -439,5 +699,9 @@ class GradientCoilDesigner:
             'n_high_orders': self.n_high_orders,
             'linearity_order': self.linearity_order,
             'apodization': self.apodization,
+            'stream_resolution_mm': self.stream_resolution,
+            'winding': self.winding,
+            'auto_fit': self.auto_fit,
+            'holder_wall_mm_used': self.wall,
             'dsv_radius_mm': self.dsv_radius,
         }

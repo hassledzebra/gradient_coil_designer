@@ -32,6 +32,14 @@ from scipy.spatial import cKDTree
 GROOVE_SAMPLES_DEFAULT = 2.5     # default export: spacing = groove_radius / 2.5
 GROOVE_SAMPLES_MIN = 2.0         # coarsest allowed for a printable export
 
+# Holders that carry a winding route (see winding.py) get a notch through the
+# flange for every wire tail.  The flange is then part of the height field, and
+# the step from body to flange is this wide instead of exactly vertical, so no
+# two grid rows share a position.
+FLANGE_STEP_MM = 0.05
+NOTCH_EXTRA_WIDTH_MM = 0.7       # notch width = wire diameter + this
+NOTCH_EXTRA_DEPTH_MM = 0.15      # notch floor is this far below the groove floor
+
 
 class CoilHolder:
     """Cylindrical holder with recessed outer-surface wire grooves.
@@ -87,6 +95,8 @@ class CoilHolder:
         self.x_half = length_mm / 2          # half-length of main cylinder body
 
         self._wire_paths_phi_x = []           # list of (phi_arr, x_arr) in radians/mm
+        self._deep_pts = None                 # (arc at R_outer, x, extra depth): lead-in channels of a route
+        self._tails = []                      # wire tails of a route: dicts with phi, end, extra, label, wire
 
     @property
     def total_length_mm(self):
@@ -107,7 +117,29 @@ class CoilHolder:
             phi_arr = np.arctan2(xyz[:, 2], xyz[:, 1])   # atan2(z, y)
             self._wire_paths_phi_x.append((phi_arr, x_arr))
 
-    def groove_surface(self, n_phi=300, n_x=200, groove_scale=1.0, max_pts_per_wire=400):
+    def add_route(self, routes):
+        """Register winding routes from ``winding.plan_route`` instead of closed loops.
+
+        The grooves follow the routes.  Where a route carries extra depth (the
+        lead-in that passes under the turns) the groove is that much deeper,
+        with the same half-pipe floor.  Each wire tail gets a notch through the
+        end flange in the STL / OBJ export.
+        """
+        deep = [] if self._deep_pts is None else [self._deep_pts]
+        for rt in routes:
+            w = np.asarray(rt['path'], float)
+            self._wire_paths_phi_x.append((w[:, 0] / self.R, w[:, 1]))
+            d = w[w[:, 2] > 0.02]
+            if len(d):
+                deep.append(np.c_[d[:, 0] / self.R * self.R_outer, d[:, 1], d[:, 2]])
+            for label, (u, x) in rt['marks']:
+                if label in ('START', 'END'):
+                    k = 0 if label == 'START' else -1
+                    self._tails.append(dict(phi=float(u / self.R), end=int(np.sign(x)) or -1,
+                                            extra=float(w[k, 2]), label=label, wire=rt.get('name', '')))
+        self._deep_pts = np.vstack(deep) if deep else None
+
+    def groove_surface(self, n_phi=300, n_x=200, groove_scale=1.0, max_pts_per_wire=400, seal_ends=True):
         """Compute the outer surface mesh with grooves indented.
 
         The groove is a circular half-pipe of radius ``groove_radius`` whose
@@ -127,6 +159,10 @@ class CoilHolder:
             Deprecated / ignored.  Wire paths are now arc-length resampled to
             ds = groove_radius/3 (densified, not capped) so the groove stays
             continuous regardless of the TFM contour point spacing.
+        seal_ends : bool
+            True (default) forces the first and last grid rows to the land
+            radius so plain end caps close the mesh.  The routed export passes
+            False, because its tail grooves run off the end of the body.
 
         Returns
         -------
@@ -165,7 +201,9 @@ class CoilHolder:
                 arc_r = np.interp(su, s, arc)
                 x_r   = np.interp(su, s, x_arr)
                 phi_r = arc_r / self.R_outer
-                for offset in (0.0, 2 * np.pi, -2 * np.pi):
+                # A route can run more than once round the former, so copies
+                # two turns either side are needed to cover every wrap.
+                for offset in (0.0, 2 * np.pi, -2 * np.pi, 4 * np.pi, -4 * np.pi):
                     arc_pts.append(self.R_outer * (phi_r + offset))
                     x_pts.append(x_r)
 
@@ -184,10 +222,30 @@ class CoilHolder:
                                0.0)
             depth_map = dm_flat.reshape(PHI.shape)
 
+            if self._deep_pts is not None and len(self._deep_pts):
+                # Lead-in channels: same half-pipe floor, lower by the extra
+                # depth each route point carries.
+                C = 2 * np.pi * self.R_outer
+                dp = np.vstack([self._deep_pts + [k * C, 0.0, 0.0] for k in (-2, -1, 0, 1, 2)])
+                # Deepest of the half-pipes within reach, not just the nearest
+                # point: where two parts of a route at different depths meet (the
+                # wire rising out of the channel), the nearest one alone would
+                # leave a step.
+                near = np.where(min_dist < 2 * gr)[0]
+                dist, j = cKDTree(dp[:, :2]).query(grid_pts[near], k=24,
+                                                   distance_upper_bound=gr, workers=-1)
+                ok = np.isfinite(dist)
+                cand = np.where(ok, dp[np.where(ok, j, 0), 2]
+                                + np.sqrt(np.clip(gr**2 - np.where(ok, dist, gr)**2, 0.0, None)), 0.0)
+                extra = np.zeros(len(grid_pts))
+                extra[near] = cand.max(axis=1)
+                depth_map = np.maximum(depth_map, extra.reshape(PHI.shape))
+
         R_surface = self.R_outer - depth_map
-        # Force boundary rows to exact R_outer so end-cap annuli seal flush
-        R_surface[0, :]  = self.R_outer
-        R_surface[-1, :] = self.R_outer
+        if seal_ends:
+            # Force boundary rows to exact R_outer so end-cap annuli seal flush
+            R_surface[0, :]  = self.R_outer
+            R_surface[-1, :] = self.R_outer
         X = XX
         Y = R_surface * np.cos(PHI)
         Z = R_surface * np.sin(PHI)
@@ -251,6 +309,9 @@ class CoilHolder:
         """
         tri_arrays = []
         n_phi, n_x = self.export_grid(n_phi, n_x)
+        if self._tails:
+            return _write_stl_binary(f"holder_{self.label}",
+                                     self._routed_tri_arrays(n_phi, n_x, include_flanges))
         phi_g = np.linspace(-np.pi, np.pi, n_phi, endpoint=False)
         has_flanges = include_flanges and self.flange_w > 0
         x_flange = self.x_half + self.flange_w  # total half-length
@@ -281,10 +342,14 @@ class CoilHolder:
                 face_x = x_sign * self.x_half
                 flange_x = x_sign * x_flange
 
-                # Step face at ±x_half: R_outer → R_flange
+                # Step face at ±x_half: R_outer → R_flange.  It faces the body
+                # (normal −x_sign), the opposite way from the flange end face, so
+                # its flip is the opposite too.  With flip=(x_sign > 0) these two
+                # rings were wound backwards: the STL was watertight but not a
+                # consistently oriented solid (negative-volume patches).
                 tri_arrays.append(_annulus_triangles(
                     face_x, self.R_outer, self.R_flange, n_phi,
-                    flip=(x_sign > 0)
+                    flip=(x_sign < 0)
                 ))
                 # Flange OD band at R_flange from face_x to flange_x
                 # flip=(x_sign > 0): x increases for right flange → outward +R normals
@@ -302,6 +367,61 @@ class CoilHolder:
                 ))
 
         return _write_stl_binary(f"holder_{self.label}", tri_arrays)
+
+    def _flange_profile(self, phi, end):
+        """Outer radius of the flange at one end as a function of angle: the
+        flange radius, with a notch at every wire tail on that end."""
+        prof = np.full(phi.shape, self.R_flange, dtype=float)
+        half = (self.wire_d + NOTCH_EXTRA_WIDTH_MM) / 2.0 / self.R_outer
+        for t in self._tails:
+            if t['end'] != end:
+                continue
+            d = np.abs(np.angle(np.exp(1j * (phi - t['phi']))))
+            floor = self.R_outer - self.groove_radius - t['extra'] - NOTCH_EXTRA_DEPTH_MM
+            prof = np.where(d <= half, np.minimum(prof, floor), prof)
+        return prof
+
+    def _routed_tri_arrays(self, n_phi, n_x, include_flanges=True):
+        """Triangles of a holder that carries a winding route.
+
+        One height field covers the body and both flanges, so the tail grooves
+        can run off the body and through a notch in the flange without any
+        boolean cut.  The end faces follow the notched outline.  Closed and
+        wound outward like the plain export.
+        """
+        phi_g = np.linspace(-np.pi, np.pi, n_phi, endpoint=False)
+        has_flanges = include_flanges and self.flange_w > 0
+        X, _, _, depth = self.groove_surface(n_phi=n_phi, n_x=n_x, seal_ends=False)
+        x_rows, r_rows = [X[:, 0]], [self.R_outer - depth]
+        if has_flanges:
+            dx = 2 * self.x_half / max(n_x - 1, 1)
+            n_f = max(2, int(math.ceil(self.flange_w / dx)) + 1)
+            for end in (-1, 1):
+                prof = self._flange_profile(phi_g, end)
+                xs = end * np.linspace(self.x_half + FLANGE_STEP_MM, self.x_half + self.flange_w, n_f)
+                rr = np.tile(prof, (n_f, 1))
+                if end < 0:
+                    x_rows.insert(0, xs[::-1]); r_rows.insert(0, rr)
+                else:
+                    x_rows.append(xs); r_rows.append(rr)
+        x_all, r_all = np.concatenate(x_rows), np.vstack(r_rows)
+        PHI, XX = np.meshgrid(phi_g, x_all)
+        tri = [_surface_to_triangles(XX, r_all * np.cos(PHI), r_all * np.sin(PHI), flip=True)]
+        # Inner bore, full length
+        PHI_i, XX_i = np.meshgrid(phi_g, np.array([x_all[0], x_all[-1]]))
+        tri.append(_surface_to_triangles(XX_i, self.R_inner * np.cos(PHI_i),
+                                         self.R_inner * np.sin(PHI_i), flip=False))
+        # End faces: from the bore to the (notched) outline of the last row
+        tri.append(_annulus_triangles(x_all[0], self.R_inner, r_all[0], n_phi, flip=False))
+        tri.append(_annulus_triangles(x_all[-1], self.R_inner, r_all[-1], n_phi, flip=True))
+        return tri
+
+    def tails(self):
+        """Wire tails of the winding route: list of dicts with 'wire', 'label'
+        (START / END), 'end' (-1 or +1) and 'angle_deg' from +Y toward +Z."""
+        return [dict(wire=t['wire'], label=t['label'], end=t['end'],
+                     angle_deg=float(np.degrees(np.angle(np.exp(1j * t['phi'])))))
+                for t in self._tails]
 
     def save_stl(self, filepath, **kwargs):
         """Write holder STL to file."""
@@ -362,14 +482,19 @@ def _surface_to_triangles(X, Y, Z, flip=False):
 
 
 def _annulus_triangles(x_pos, r_inner, r_outer, n_phi, flip=False):
-    """Triangulated annulus at a fixed x position → (N, 3, 3) float32."""
+    """Triangulated annulus at a fixed x position → (N, 3, 3) float32.
+
+    r_outer may be an array of n_phi radii (an outline that varies with angle).
+    """
     phi = np.linspace(-np.pi, np.pi, n_phi, endpoint=False)
     phi_next = np.roll(phi, -1)
+    ro = np.broadcast_to(np.asarray(r_outer, dtype=float), phi.shape)
+    ro_next = np.roll(ro, -1)
     x = np.full(n_phi, x_pos, dtype=np.float32)
     vi = np.stack([x, r_inner * np.cos(phi),      r_inner * np.sin(phi)],      axis=1)
     vj = np.stack([x, r_inner * np.cos(phi_next), r_inner * np.sin(phi_next)], axis=1)
-    vk = np.stack([x, r_outer * np.cos(phi),      r_outer * np.sin(phi)],      axis=1)
-    vl = np.stack([x, r_outer * np.cos(phi_next), r_outer * np.sin(phi_next)], axis=1)
+    vk = np.stack([x, ro * np.cos(phi),           ro * np.sin(phi)],           axis=1)
+    vl = np.stack([x, ro_next * np.cos(phi_next), ro_next * np.sin(phi_next)], axis=1)
     if not flip:
         t1 = np.stack([vi, vj, vk], axis=1)
         t2 = np.stack([vl, vk, vj], axis=1)

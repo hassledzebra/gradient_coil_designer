@@ -195,7 +195,7 @@ class App(ctk.CTk):
         self._bore     = entry("Bore radius",        78.0, "mm")
         self._dsv      = entry("Linear region (DSV)", 40.0, "mm")
         self._hlength  = entry("Holder length",      145.0, "mm")
-        self._wall     = entry("Wall thickness",       3.0, "mm")
+        self._wall     = entry("Wall thickness",       3.5, "mm")
         self._gap      = entry("Layer gap",            2.5, "mm")
         self._flange_w = entry("Flange width",         5.0, "mm")
         self._flange_t = entry("Flange thickness",     5.0, "mm")
@@ -204,6 +204,14 @@ class App(ctk.CTk):
         section("Wire & Winding")
         self._wire_d   = entry("Wire diameter",  1.5, "mm")
         self._n_wires  = entry("Wires/quadrant", 10)
+        # "One wire (spiral)" joins the loops into a route a single wire can follow
+        # (winding.py); it needs a wall of about 3.5 mm or more for 1.5 mm wire.
+        self._winding  = combo("Winding", ["One wire (spiral)", "Closed loops"], "One wire (spiral)")
+        # Auto-fit adjusts the design (wall, coil ends, as a last resort the turns)
+        # until the wire fits everywhere; what it changed is listed in the Log tab.
+        self._autofit_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(sb, text="Auto-fit so the wire always fits", variable=self._autofit_var,
+                         checkmark_color=_FG, fg_color=_ACCENT).pack(**pad)
 
         # ── Axes ──
         section("Gradient Axes")
@@ -219,7 +227,7 @@ class App(ctk.CTk):
         section("Advanced (TFM)")
         self._n_orders  = entry("Higher order terms", 10)
         self._lin_order = entry("Linearity order",    16)
-        self._apo       = entry("Apodization",       0.05)
+        self._apo       = entry("Apodization",       0.015)
 
         # ── Verification ──
         section("Field Verification")
@@ -336,6 +344,9 @@ class App(ctk.CTk):
                 verify_field      = self._verify_var.get(),
                 verify_half_range_mm = float(self._dsv.get()) / 2,
                 verify_n_pts      = int(self._verify_pts.get()),
+                winding           = ("spiral" if str(self._winding.get()).startswith("One")
+                                     else "loops"),
+                auto_fit          = self._autofit_var.get(),
             )
             result = d.run(axes)
             self._result = result
@@ -476,6 +487,15 @@ class App(ctk.CTk):
             self._log(f"  B-S line:       {grad_str}")
             self._log(f"  Wire length:    {info['wire_length_m']:.2f} m")
             self._log(f"  Wire segments:  {len(info['wires_3d'])}")
+            if info.get("n_wires_used") is not None:
+                self._log(f"  Turns/quadrant: {info['n_wires_used']}")
+            for note in (info.get("adjustments") or []):
+                self._log(f"  Adjusted:       {note}")
+            for rt in (info.get("routes") or []):
+                tails = ", ".join(f"{t['label']} at {t['angle_deg']:.0f} deg"
+                                  for t in h.tails() if t["wire"] == rt["name"])
+                self._log(f"  Wire {rt['name']}: {rt['n_lobes']} lobes, {rt['n_turns']} turns, "
+                          f"tails at the {'+x' if rt['end'] > 0 else '-x'} end ({tails})")
         self._log("")
 
     # ── Export helpers ────────────────────────────────────────────────────────

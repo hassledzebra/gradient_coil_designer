@@ -58,10 +58,10 @@ def holder_to_obj(holder, n_phi=None, n_x=None) -> str:
     for v in verts_mm:
         lines.append(f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}")
     for f in faces:
-        # OBJ is 1-indexed; quads → two triangles
-        a, b, c, d = [idx + 1 for idx in f]
-        lines.append(f"f {a} {b} {c}")
-        lines.append(f"f {a} {c} {d}")
+        # OBJ is 1-indexed; quads → two triangles (routed holders are triangles already)
+        idx = [i + 1 for i in f]
+        for k in range(1, len(idx) - 1):
+            lines.append(f"f {idx[0]} {idx[k]} {idx[k + 1]}")
     return "\n".join(lines) + "\n"
 
 
@@ -173,13 +173,22 @@ def _holder_mesh_data(holder, n_phi=None, n_x=None, groove_scale=1.0):
     all_faces = []
 
     def add(verts, faces):
+        # Every part is rounded the same way, so vertices that two parts share
+        # (seam rings) land on identical coordinates and weld by position.
         offset = len(all_verts)
-        all_verts.extend(verts)
+        all_verts.extend(np.round(np.asarray(verts, float), 3).tolist())
         for f in faces:
             all_faces.append([idx + offset for idx in f])
 
-    # ── Outer grooved surface ────────────────────────────────────────────────
     n_phi, n_x = holder.export_grid(n_phi, n_x)
+    if getattr(holder, '_tails', None):
+        # A holder with a winding route: same triangles as its STL (grooves that
+        # run off the body, notched flanges), welded by position.
+        tris = np.concatenate(holder._routed_tri_arrays(n_phi, n_x), axis=0)
+        verts, inv = np.unique(np.round(tris.reshape(-1, 3).astype(float), 3), axis=0, return_inverse=True)
+        return verts.tolist(), np.asarray(inv).reshape(-1, 3).tolist()
+
+    # ── Outer grooved surface ────────────────────────────────────────────────
     X_o, Y_o, Z_o, _ = holder.groove_surface(n_phi=n_phi, n_x=n_x, groove_scale=groove_scale)
     nr, nc = X_o.shape
     outer_verts = np.round(
@@ -187,46 +196,45 @@ def _holder_mesh_data(holder, n_phi=None, n_x=None, groove_scale=1.0):
     ).tolist()
     add(outer_verts, _grid_quads(nr, nc, flip=True))   # outward +R normals
 
-    # ── Inner bore surface ───────────────────────────────────────────────────
-    phi_g = np.linspace(-np.pi, np.pi, n_phi, endpoint=False)
-    x_g   = np.linspace(-holder.x_half, holder.x_half, n_x)
-    PHI, XX = np.meshgrid(phi_g, x_g)
-    inner_verts = np.round(np.column_stack([
-        XX.ravel(),
-        (holder.R_inner * np.cos(PHI)).ravel(),
-        (holder.R_inner * np.sin(PHI)).ravel(),
-    ]), 3).tolist()
-    add(inner_verts, _grid_quads(nr, nc, flip=False))  # inward −R normals
+    # Same closed topology as CoilHolder.to_stl_bytes (every edge shared by two
+    # faces, all faces wound outward), so the OBJ / Blender mesh is a printable
+    # solid as well.  The earlier version left the bore open at the flanges and
+    # kept the body end caps inside the flange.
+    has_flanges = holder.flange_w > 0
+    xb = holder.x_half
+    xf = holder.x_half + holder.flange_w
+    x_end = xf if has_flanges else xb
 
-    # ── End cap annuli ───────────────────────────────────────────────────────
-    for x_sign in (-1, 1):
-        v, f = _annulus_quads(
-            x_sign * holder.x_half, holder.R_inner, holder.R_outer,
-            n_phi, flip=(x_sign > 0)
-        )
-        add(v, f)
+    # ── Inner bore: a plain cylinder, two rings, full length ─────────────────
+    v, f = _band_quads(-x_end, x_end, holder.R_inner, n_phi, flip=True)   # inward −R normals
+    add(v, f)
 
-    # ── Flanges ──────────────────────────────────────────────────────────────
-    if holder.flange_w > 0:
+    if not has_flanges:
+        # ── End caps: R_inner → R_outer at ±x_half ───────────────────────────
         for x_sign in (-1, 1):
-            xb = holder.x_half
-            xf = holder.x_half + holder.flange_w
-            # Outer face of flange
             v, f = _annulus_quads(
-                x_sign * xf, holder.R_inner, holder.R_flange,
-                n_phi, flip=(x_sign < 0)
+                x_sign * xb, holder.R_inner, holder.R_outer,
+                n_phi, flip=(x_sign > 0)
             )
             add(v, f)
-            # Inner face of flange (ring between R_outer and R_flange)
+    else:
+        for x_sign in (-1, 1):
+            # Step face between body and flange (faces the body)
             v, f = _annulus_quads(
                 x_sign * xb, holder.R_outer, holder.R_flange,
-                n_phi, flip=(x_sign > 0)
+                n_phi, flip=(x_sign < 0)
             )
             add(v, f)
             # Outer band of flange
             v, f = _band_quads(
                 x_sign * xb, x_sign * xf, holder.R_flange,
                 n_phi, flip=(x_sign < 0)
+            )
+            add(v, f)
+            # End face of flange: R_inner → R_flange
+            v, f = _annulus_quads(
+                x_sign * xf, holder.R_inner, holder.R_flange,
+                n_phi, flip=(x_sign > 0)
             )
             add(v, f)
 
