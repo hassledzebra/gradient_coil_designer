@@ -465,8 +465,15 @@ class App(ctk.CTk):
             self._log(f"\n{lbl}:")
             self._log(f"  Coil radius:    {info['coil_radius_mm']:.1f} mm")
             self._log(f"  Holder OD/ID:   {h.R_outer*2:.1f} / {h.R_inner*2:.1f} mm")
-            self._log(f"  TFM efficiency: {info['efficiency_mT_m_A']:.3f} mT/m/A")
-            self._log(f"  B-S gradient:   {grad_str}")
+            dsv = info.get("dsv")
+            self._log(f"  Efficiency:     {info['efficiency_mT_m_A']:.3f} mT/m/A")
+            if dsv:
+                self._log(f"  DSV linearity:  {dsv['max_deviation_pct']:.1f}% max, "
+                          f"{dsv['rms_deviation_pct']:.1f}% rms "
+                          f"over r={dsv['dsv_radius_mm']:.0f} mm")
+            if info.get("open_paths"):
+                self._log(f"  !! {info['open_paths']} open loops -- field results unreliable")
+            self._log(f"  B-S line:       {grad_str}")
             self._log(f"  Wire length:    {info['wire_length_m']:.2f} m")
             self._log(f"  Wire segments:  {len(info['wires_3d'])}")
         self._log("")

@@ -17,6 +17,8 @@ Usage
 
 import os
 import json
+import warnings
+
 import numpy as np
 
 from . import tfm
@@ -37,7 +39,11 @@ class GradientCoilDesigner:
     bore_radius_mm : float
         Inner bore radius (mm).  The outermost coil/holder must fit inside.
     linear_region_mm : float
-        Target DSV diameter (mm) for the linear imaging region.
+        Half-extent (radius) of the target linear region, in mm -- NOT the
+        diameter.  This is the ``d`` that shapes the axial target profile in
+        ``tfm``, so a value of 40 asks for linearity over |x| <= 40 mm, an
+        80 mm DSV.  It also sets the default radius of the DSV over which
+        linearity is scored.
     holder_length_mm : float
         Total axial length of the holders (mm).
     wire_diameter_mm : float
@@ -57,13 +63,22 @@ class GradientCoilDesigner:
     linearity_order : int
         Order of the linearity shaping polynomial (8–20).
     apodization : float
-        Apodization coefficient (0.02–0.10).  Higher = smoother but lower G.
+        Gaussian k-space smoothing length in metres.  This is the
+        regularization: the target-field inverse kernel grows like exp(k*a)
+        (~1e100 across the band), so too small a value amplifies high-k noise
+        and too large a value collapses the pattern to a single sinusoid.
+        0.012-0.020 is the usable range for a bore of this size; ``tfm`` warns
+        outside it.  (Values around 0.05 were right for the pre-fix code, which
+        used a mis-scaled k axis -- they over-smooth badly now.)
     coil_length_factor : float
         coil_length_mm = coil_length_factor * linear_region_mm (Gy/Gz).
     groove_clearance_mm : float
         Extra clearance added to groove radius for wire fit.
     verify_field : bool
         If True, run Biot-Savart verification after design.
+    dsv_radius_mm : float or None
+        Radius of the sphere over which gradient efficiency and linearity are
+        scored.  Defaults to ``linear_region_mm``.
     verify_half_range_mm : float
         Sampling half-range for Biot-Savart profile (mm).
     verify_n_pts : int
@@ -83,10 +98,11 @@ class GradientCoilDesigner:
         n_wires: int = 10,
         n_high_orders: int = 10,
         linearity_order: int = 16,
-        apodization: float = 0.05,
+        apodization: float = 0.015,
         coil_length_factor: float = 3.0,
         groove_clearance_mm: float = 0.1,
         verify_field: bool = True,
+        dsv_radius_mm: float = None,
         verify_half_range_mm: float = 30.0,
         verify_n_pts: int = 21,
     ):
@@ -105,6 +121,8 @@ class GradientCoilDesigner:
         self.coil_length_factor = coil_length_factor
         self.groove_clearance = groove_clearance_mm
         self.do_verify = verify_field
+        self.dsv_radius = (linear_region_mm if dsv_radius_mm is None
+                           else dsv_radius_mm)
         self.verify_range = verify_half_range_mm
         self.verify_n_pts = verify_n_pts
 
@@ -142,7 +160,10 @@ class GradientCoilDesigner:
           'wires_3d'          -- list of wire dicts (from tfm.wire_paths_to_3d)
           'contour_set'       -- raw matplotlib contour object
           'coil_radius_mm'    -- radius used
-          'efficiency_mT_m_A' -- gradient efficiency
+          'efficiency_mT_m_A' -- gradient efficiency from the 3-D DSV fit
+          'dsv'               -- full DSV metric dict (physics.dsv_metrics)
+          'amperes_per_turn'  -- current per turn for a unit stream function
+          'open_paths'        -- contours that failed to close (should be 0)
           'wire_length_m'     -- total wire length
           'axial_extent_mm'   -- (min_x, max_x) tuple
           'profile'           -- Biot-Savart profile dict (if verify_field=True)
@@ -173,13 +194,22 @@ class GradientCoilDesigner:
         else:
             raise ValueError(f'Unknown axis: {axis!r}. Use Gx, Gy, or Gz.')
 
+        n_open = tfm.open_path_count(wire_paths)
+        if n_open:
+            warnings.warn(
+                f'{axis}: {n_open} of {len(wire_paths)} contours do not close. '
+                f'Open paths are not valid current loops, so the field results '
+                f'below are not trustworthy.',
+                RuntimeWarning, stacklevel=2,
+            )
+
         wires_3d = tfm.wire_paths_to_3d(wire_paths, R)
-        eff = tfm.gradient_efficiency(cs)
+        i_turn = tfm.amperes_per_turn(cs)
         wl = tfm.wire_length_m(wires_3d)
         ext = tfm.wire_axial_extent_mm(wires_3d)
 
-        print(f' {len(wires_3d)} segments, +/-{max(abs(ext[0]),abs(ext[1])):.0f}mm extent, '
-              f'{eff:.2f} mT/m/A', flush=True)
+        print(f' {len(wires_3d)} loops, +/-{max(abs(ext[0]),abs(ext[1])):.0f}mm extent',
+              flush=True)
 
         # Build holder
         holder = CoilHolder(
@@ -200,8 +230,20 @@ class GradientCoilDesigner:
         #   Gy: By != 0 on y-axis (x=z=0)  -> sample along y
         #   Gz: By = 0 on y=0 plane         -> offset to y = R/3
         profile = None
+        dsv = None
         if self.do_verify:
             profile_axis = axis[-1].lower()   # 'x', 'y', 'z'
+
+            # Volume metric first: this is the number that decides whether the
+            # design is good.  A line profile can look linear while the field
+            # bows off-axis, so efficiency is taken from the 3-D fit, not from
+            # contour spacing (which is amperes per turn, not mT/m/A).
+            print(f'    Scoring over {self.dsv_radius:.0f}mm-radius DSV...',
+                  end='', flush=True)
+            dsv = phys.dsv_metrics(wires_3d, profile_axis, self.dsv_radius)
+            print(f" {dsv['efficiency_mT_m_A']:.3f} mT/m/A, "
+                  f"{dsv['max_deviation_pct']:.1f}% max deviation", flush=True)
+
             offset = np.zeros(3)
             if axis == 'Gz':
                 offset[1] = R * 1e-3 / 3.0   # y-offset so By != 0 by symmetry
@@ -225,7 +267,10 @@ class GradientCoilDesigner:
             'wires_3d': wires_3d,
             'contour_set': cs,
             'coil_radius_mm': R,
-            'efficiency_mT_m_A': eff,
+            'efficiency_mT_m_A': (dsv['efficiency_mT_m_A'] if dsv else float('nan')),
+            'amperes_per_turn': i_turn,
+            'open_paths': n_open,
+            'dsv': dsv,
             'wire_length_m': wl,
             'axial_extent_mm': ext,
             'profile': profile,
@@ -279,8 +324,8 @@ class GradientCoilDesigner:
         print('-' * 65)
         print('  DESIGN SUMMARY')
         print('-' * 65)
-        print(f"  {'Axis':<6}{'R (mm)':<10}{'Efficiency':>14}{'Wire (m)':>12}"
-              f"{'Extent mm':>14}{'Linearity':>12}")
+        print(f"  {'Axis':<6}{'R mm':>7}{'mT/m/A':>10}{'DSV max':>10}{'DSV rms':>10}"
+              f"{'Wire m':>9}{'Extent mm':>12}{'Line':>8}")
         print('  ' + '-' * 63)
 
         copper_rho = 1.68e-8
@@ -289,17 +334,32 @@ class GradientCoilDesigner:
 
         for lbl, info in coils.items():
             R = info['coil_radius_mm']
-            eff = info['efficiency_mT_m_A']
             wl = info['wire_length_m']
             ext = info['axial_extent_mm']
             R_ohm = copper_rho * wl / wire_area
+            dsv = info.get('dsv')
             profile = info.get('profile')
+
+            eff_str = f"{dsv['efficiency_mT_m_A']:.3f}" if dsv else '-'
+            max_str = f"{dsv['max_deviation_pct']:.1f}%" if dsv else '-'
+            rms_str = f"{dsv['rms_deviation_pct']:.1f}%" if dsv else '-'
+            # Kept only to show how much the single-line metric flatters the
+            # design relative to the volume metric next to it.
             lin_str = f"{profile['linearity_pct']:.1f}%" if profile else '-'
             extent_str = f"+/-{max(abs(ext[0]),abs(ext[1])):.0f}"
-            print(f"  {lbl:<6}{R:<10.1f}{eff:>13.3f}{'mT/m/A':>1}"
-                  f"{wl:>11.2f}m{extent_str:>14}mm{lin_str:>10}")
+
+            print(f"  {lbl:<6}{R:>7.1f}{eff_str:>10}{max_str:>10}{rms_str:>10}"
+                  f"{wl:>9.2f}{extent_str:>12}{lin_str:>8}")
+            flag = f"  !! {info['open_paths']} OPEN LOOPS" if info.get('open_paths') else ''
             print(f"  {'':6}holder OD/ID: {info['holder'].R_outer*2:.0f}/{info['holder'].R_inner*2:.0f} mm"
-                  f"  R={R_ohm:.4f} Ohm")
+                  f"  R={R_ohm:.4f} Ohm{flag}")
+
+        dsv_r = next((c['dsv']['dsv_radius_mm'] for c in coils.values() if c.get('dsv')), None)
+        if dsv_r is not None:
+            print()
+            print(f"  DSV max/rms: worst and rms departure from a perfect linear field")
+            print(f"  over a {dsv_r:.0f} mm-radius sphere, as % of the ideal field at its edge.")
+            print(f"  'Line' is the old single-axis metric, shown for comparison only.")
 
         print()
         # Nesting gaps
@@ -348,6 +408,9 @@ class GradientCoilDesigner:
             summary['coils'][lbl] = {
                 'coil_radius_mm': info['coil_radius_mm'],
                 'efficiency_mT_m_A': info['efficiency_mT_m_A'],
+                'amperes_per_turn': info.get('amperes_per_turn'),
+                'open_paths': info.get('open_paths'),
+                'dsv': info.get('dsv'),
                 'wire_length_m': info['wire_length_m'],
                 'axial_extent_mm': list(info['axial_extent_mm']),
                 'gradient_mT_m_A_BS': profile['gradient_mT_m_A'] if profile else None,
@@ -376,4 +439,5 @@ class GradientCoilDesigner:
             'n_high_orders': self.n_high_orders,
             'linearity_order': self.linearity_order,
             'apodization': self.apodization,
+            'dsv_radius_mm': self.dsv_radius,
         }

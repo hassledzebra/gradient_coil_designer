@@ -39,6 +39,101 @@ def _calcQ(mm, aa, bb, kk):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# k-space axis
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The k=0 bin is evaluated at this instead of exactly zero.  Every kernel used
+# below enters as 1/((P+Q)*k), and P+Q ~ C/k as k->0, so the product has a
+# finite limit; it is flat to 6 significant figures for k <= 1e-3, while k=0
+# itself would divide by zero in _calcQ (abs(k)/k) and in the explicit 1/k.
+_K_EPS = 1e-6
+
+
+def _fft_wavenumbers(z):
+    """Angular wavenumbers (rad/m) matching the bin order of ``np.fft.fft(f(z))``.
+
+    ``np.fft.fft`` returns bins in the order 0, +dk, ..., +k_nyq, -k_nyq, ..., -dk.
+    Any k axis paired with it must use that same ordering and the same scale,
+    ``2*pi*fftfreq(N, dz)``; a monotonically increasing array is not the
+    frequency axis of an FFT and silently mislabels every negative frequency as
+    a high positive one.
+
+    P and Q are odd in k and the apodization is even, so with this axis the
+    integrand is Hermitian and the inverse transform is real by construction.
+    """
+    dz = float(z[1] - z[0])
+    k = 2 * np.pi * np.fft.fftfreq(len(z), d=dz)
+    k[0] = _K_EPS
+    return k
+
+
+def _check_conditioning(mm, aa, bb, kk, apodization, label):
+    """Warn when the apodization does not tame the ill-posed inverse kernel.
+
+    1/(P+Q) grows like exp(|k|*a) -- roughly 1e100 between DC and Nyquist for a
+    typical bore -- so the Gaussian apodization is what makes the inversion
+    stable, not a cosmetic smoother.  Too small and high-k noise is amplified;
+    too large (or a domain too short to resolve it) and only a couple of
+    spectral bins survive, collapsing the stream function to a single sinusoid.
+    """
+    t_k = np.exp(-2 * (apodization * kk) ** 2)
+    with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
+        kernel = np.abs(1.0 / ((_calcP(mm, aa, bb, kk) + _calcQ(mm, aa, bb, kk)) * kk))
+        gain = kernel * t_k
+    gain = np.nan_to_num(gain, nan=0.0, posinf=0.0)
+
+    amplification = gain.max() / gain[0] if gain[0] > 0 else np.inf
+    if amplification > 10.0:
+        warnings.warn(
+            f'{label}: apodization={apodization} is too small for a coil of radius '
+            f'{aa*1e3:.0f} mm -- the inverse kernel is amplified {amplification:.1e}x '
+            f'at high k. Increase it (0.012-0.020 is the usable range here).',
+            RuntimeWarning, stacklevel=3,
+        )
+
+    n_live = int(np.count_nonzero(t_k[:len(kk) // 2] > 1e-3))
+    if n_live < 6:
+        warnings.warn(
+            f'{label}: only {n_live} spectral bins survive apodization={apodization}. '
+            f'The computation domain is too short for that smoothing length; '
+            f'lengthen it or reduce the apodization.',
+            RuntimeWarning, stacklevel=3,
+        )
+
+
+def _close_axial_ends(streamF, taper_frac=0.04, label=''):
+    """Force the stream function to zero at both axial ends of the former.
+
+    No current can flow off the end of a finite former, so psi must vanish
+    there; if it does not, the contours run off the edge of the domain and come
+    back as open arcs, which are not closed current loops and make any
+    Biot-Savart result meaningless.  The ends are tapered with a raised cosine
+    rather than hard-clamped so the truncation does not inject a step in the
+    current density.
+
+    A warning is raised when a lot of psi is being thrown away, which means the
+    computation domain is too short for the requested linear region.
+    """
+    n = streamF.shape[0]
+    peak = np.abs(streamF).max()
+    edge = max(np.abs(streamF[0]).max(), np.abs(streamF[-1]).max())
+    if peak > 0 and edge / peak > 0.05:
+        warnings.warn(
+            f'{label}: stream function is still {edge/peak*100:.0f}% of peak at the '
+            f'axial ends; the coil is being truncated. Lengthen the coil or shrink '
+            f'the linear region.',
+            RuntimeWarning, stacklevel=3,
+        )
+
+    n_taper = max(2, int(round(taper_frac * n)))
+    window = np.ones(n)
+    ramp = 0.5 * (1 - np.cos(np.pi * np.arange(n_taper) / (n_taper - 1)))
+    window[:n_taper] = ramp
+    window[-n_taper:] = ramp[::-1]
+    return streamF * window[:, None]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Contour extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -96,8 +191,9 @@ def compute_gx_stream(
     num_wires=10,
     num_high_orders=10,
     linearity_order=16,
-    apodization=0.05,
+    apodization=0.015,
     resolution=1e-3,
+    pad_factor=4.0,
 ):
     """Gx (dBy/dx) stream function — axial saddle, cos(phi) symmetry."""
     a = coil_radius_mm * 1e-3
@@ -105,17 +201,23 @@ def compute_gx_stream(
     d = linear_region_mm * 1e-3
     Zmax = coil_length_mm * 1e-3
 
-    Nsamp = int(2 * Zmax / resolution)
-    z = np.linspace(-Zmax, Zmax, Nsamp)
-    phi = np.linspace(-1.5 * np.pi, 0.5 * np.pi, Nsamp)
-    k = np.linspace(1e-5, 1 / resolution, Nsamp)
+    # Zero-pad the transform domain: the FFT bin spacing is 2*pi/L, and Gx's
+    # physical domain (~+/-70 mm) is too short to resolve the apodization
+    # length on its own.  The stream function is cropped back to +/-Zmax below.
+    Zfft = pad_factor * Zmax
+    Nsamp = int(2 * Zfft / resolution)
+    n_phi = int(2 * Zmax / resolution)
+    z = np.linspace(-Zfft, Zfft, Nsamp)
+    phi = np.linspace(-1.5 * np.pi, 0.5 * np.pi, n_phi)
+    k = _fft_wavenumbers(z)
+    _check_conditioning(1, a, b, k, apodization, 'Gx')
 
     grad_shape = z / (1 + (z / d) ** linearity_order)
     grad_shape_k = np.fft.fft(grad_shape)
     t_k = np.exp(-2 * (apodization * k) ** 2)
 
     n_0 = 2 * np.pi * grad_shape_k * 1e-3 / (_calcQ(1, a, b, k) + _calcP(1, a, b, k))
-    streamF = np.zeros((Nsamp, Nsamp))
+    streamF = np.zeros((Nsamp, n_phi))
 
     for n in range(num_high_orders + 1):
         sign = (-1) ** (n + 1)
@@ -126,7 +228,14 @@ def compute_gx_stream(
         B_apo = sign * np.fft.ifft(n_0 * t_k * scale / k)
         streamF += np.outer(np.real(B_apo), np.cos((2 * n + 1) * phi))
 
-    return compute_contour_paths(np.real(streamF), num_wires, phi, z)
+    # Crop the padding back off, then force the stream function to zero at the
+    # axial ends so every contour closes (see _close_axial_ends).
+    keep = np.abs(z) <= Zmax
+    streamF = streamF[keep]
+    z = z[keep]
+    streamF = _close_axial_ends(streamF, label='Gx')
+
+    return compute_contour_paths(streamF, num_wires, phi, z)
 
 
 def compute_gy_stream(
@@ -135,7 +244,7 @@ def compute_gy_stream(
     coil_length_mm=150,
     num_wires=10,
     linearity_order=16,
-    apodization=0.05,
+    apodization=0.015,
     resolution=1e-3,
 ):
     """Gy (dBy/dy) stream function — 45°-rotated quadrupole, cos(2*phi) symmetry."""
@@ -147,7 +256,8 @@ def compute_gy_stream(
     Nsamp = int(2 * Zmax / resolution)
     z = np.linspace(-Zmax, Zmax, Nsamp)
     phi = np.linspace(-np.pi, np.pi, Nsamp) + np.pi / 4
-    k = np.linspace(1e-5, 1 / resolution, Nsamp)
+    k = _fft_wavenumbers(z)
+    _check_conditioning(2, a, b, k, apodization, 'Gy')
 
     grad_shape = (1 / (1 + (z / d) ** linearity_order)
                   - 1 / (1 + ((z + 3.5 * d) / (0.5 * d)) ** linearity_order)
@@ -164,6 +274,7 @@ def compute_gy_stream(
     i_hi = int(Nsamp / 2 + 1.5 * d_samp)
     streamF = streamF[i_lo:i_hi]
     z = z[i_lo:i_hi]
+    streamF = _close_axial_ends(streamF, label='Gy')
 
     return compute_contour_paths(streamF, num_wires, phi, z)
 
@@ -174,7 +285,7 @@ def compute_gz_stream(
     coil_length_mm=150,
     num_wires=10,
     linearity_order=16,
-    apodization=0.05,
+    apodization=0.015,
     resolution=1e-3,
 ):
     """Gz (dBy/dz) stream function — quadrupole, sin(2*phi) symmetry."""
@@ -186,7 +297,8 @@ def compute_gz_stream(
     Nsamp = int(2 * Zmax / resolution)
     z = np.linspace(-Zmax, Zmax, Nsamp)
     phi = np.linspace(-np.pi, np.pi, Nsamp)
-    k = np.linspace(1e-5, 1 / resolution, Nsamp)
+    k = _fft_wavenumbers(z)
+    _check_conditioning(2, a, b, k, apodization, 'Gz')
 
     grad_shape = (1 / (1 + (z / d) ** linearity_order)
                   - 1 / (1 + ((z + 3.5 * d) / (0.5 * d)) ** linearity_order)
@@ -202,9 +314,8 @@ def compute_gz_stream(
     i_lo = int(Nsamp / 2 - 1.5 * d_samp)
     i_hi = int(Nsamp / 2 + 1.5 * d_samp)
     streamF = streamF[i_lo:i_hi]
-    streamF[0] = 0
-    streamF[-1] = 0
     z = z[i_lo:i_hi]
+    streamF = _close_axial_ends(streamF, label='Gz')
 
     return compute_contour_paths(streamF, num_wires, phi, z)
 
@@ -256,9 +367,26 @@ def wire_axial_extent_mm(wires_3d):
     return xs.min() * 1000, xs.max() * 1000
 
 
-def gradient_efficiency(contour_set):
-    """Estimate gradient efficiency (mT/m/A) from contour level spacing."""
+def amperes_per_turn(contour_set):
+    """Current carried by each turn, in amperes, for a unit stream function.
+
+    Adjacent contours of a stream function bound one turn's worth of current,
+    so the level spacing *is* the per-turn current.  This is not the gradient
+    efficiency -- 1/(level spacing) has units of 1/A, not mT/m/A.  Efficiency
+    has to come from the field the wires actually produce; use
+    ``physics.dsv_metrics``.
+    """
     lvls = contour_set.levels
     if len(lvls) > 1:
-        return abs(1.0 / (lvls[1] - lvls[0]))
+        return abs(float(lvls[1] - lvls[0]))
     return 0.0
+
+
+def open_path_count(wire_paths, tol=1e-9):
+    """Number of contours that do not close on themselves.
+
+    Open paths are not valid current loops (they violate div J = 0), so any
+    field computed from them is meaningless.  Should always be zero.
+    """
+    return sum(1 for _, p in wire_paths
+               if float(np.linalg.norm(p[0] - p[-1])) > tol)
