@@ -43,8 +43,11 @@ _HOLDER_COLORS = {
 # OBJ export
 # ─────────────────────────────────────────────────────────────────────────────
 
-def holder_to_obj(holder, n_phi=300, n_x=200) -> str:
-    """Generate Wavefront OBJ text for a holder mesh (no MTL)."""
+def holder_to_obj(holder, n_phi=None, n_x=None) -> str:
+    """Generate Wavefront OBJ text for a holder mesh (no MTL).
+
+    Grid defaults to holder.export_grid() so the grooves stay continuous.
+    """
     verts_mm, faces = _holder_mesh_data(holder, n_phi=n_phi, n_x=n_x, groove_scale=1.0)
 
     lines = [
@@ -157,8 +160,11 @@ def _band_quads(x0, x1, R, n_phi, flip=False):
     return verts, faces
 
 
-def _holder_mesh_data(holder, n_phi=300, n_x=200, groove_scale=1.0):
+def _holder_mesh_data(holder, n_phi=None, n_x=None, groove_scale=1.0):
     """Return (verts_mm, faces) for the full holder shell.
+
+    n_phi, n_x default to holder.export_grid(), which ties the grid spacing to
+    the groove radius; anything coarser would print dotted, broken grooves.
 
     Mesh is built entirely in Python/numpy so it works inside Blender's
     embedded Python without scipy or any external library.
@@ -173,6 +179,7 @@ def _holder_mesh_data(holder, n_phi=300, n_x=200, groove_scale=1.0):
             all_faces.append([idx + offset for idx in f])
 
     # ── Outer grooved surface ────────────────────────────────────────────────
+    n_phi, n_x = holder.export_grid(n_phi, n_x)
     X_o, Y_o, Z_o, _ = holder.groove_surface(n_phi=n_phi, n_x=n_x, groove_scale=groove_scale)
     nr, nc = X_o.shape
     outer_verts = np.round(
@@ -240,7 +247,7 @@ def generate_blender_script(result, output_blend_path=None) -> str:
     coil_data = {}
     for lbl, info in result["coils"].items():
         holder = info["holder"]
-        verts_mm, faces = _holder_mesh_data(holder, n_phi=300, n_x=200, groove_scale=1.0)
+        verts_mm, faces = _holder_mesh_data(holder, groove_scale=1.0)
         coil_data[lbl] = {
             "wires": [
                 {"xyz": w["xyz"].tolist(), "level": float(w["level"])}

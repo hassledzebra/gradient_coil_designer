@@ -15,7 +15,22 @@ Units: millimeters throughout (unlike tfm.py which uses meters).
 import numpy as np
 import struct
 import io
+import math
+import warnings
 from scipy.spatial import cKDTree
+
+# Groove continuity rule (the v11 holders' "trick").
+# The groove is a height field sampled on a (phi, x) grid, so the STL can only
+# show it where grid nodes fall inside the half-pipe.  If the node spacing is
+# comparable to the groove width, a wire running between two nodes leaves no
+# groove at all and the channel prints as a dotted line.  v11
+# (cooley/build_clean_holders.py) samples at 0.62 x 0.65 mm for a 0.85 mm groove
+# radius and its grooves are continuous; the old GUI export used 2-3 mm and
+# left ~5-7% of the wire path with no groove.  So the grid is tied to the
+# groove: at least GROOVE_SAMPLES_MIN nodes per groove radius, both around the
+# circumference and along the axis.
+GROOVE_SAMPLES_DEFAULT = 2.5     # default export: spacing = groove_radius / 2.5
+GROOVE_SAMPLES_MIN = 2.0         # coarsest allowed for a printable export
 
 
 class CoilHolder:
@@ -178,6 +193,33 @@ class CoilHolder:
         Z = R_surface * np.sin(PHI)
         return X, Y, Z, depth_map
 
+    def export_grid(self, n_phi=None, n_x=None, samples_per_radius=GROOVE_SAMPLES_DEFAULT):
+        """Grid size for a fabrication export, tied to the groove radius.
+
+        ``None`` picks a grid at ``groove_radius / samples_per_radius`` spacing.
+        An explicit value coarser than ``groove_radius / GROOVE_SAMPLES_MIN`` is
+        raised to that minimum with a warning, because a coarser grid cannot
+        represent a continuous groove (see GROOVE_SAMPLES_MIN above).
+        """
+        def need(span_mm, k):
+            return int(math.ceil(span_mm * k / self.groove_radius))
+
+        circ, axial = 2 * np.pi * self.R_outer, 2 * self.x_half
+        auto_phi, auto_x = need(circ, samples_per_radius), need(axial, samples_per_radius) + 1
+        min_phi, min_x = need(circ, GROOVE_SAMPLES_MIN), need(axial, GROOVE_SAMPLES_MIN) + 1
+        n_phi = auto_phi if n_phi is None else int(n_phi)
+        n_x = auto_x if n_x is None else int(n_x)
+        if n_phi < min_phi or n_x < min_x:
+            warnings.warn(
+                f'{self.label}: a {n_phi} x {n_x} grid is too coarse for a '
+                f'{self.groove_radius:.2f} mm groove radius ({circ / n_phi:.2f} x '
+                f'{axial / max(n_x - 1, 1):.2f} mm spacing) and would print broken, '
+                f'dotted grooves. Using {max(n_phi, min_phi)} x {max(n_x, min_x)}.',
+                RuntimeWarning, stacklevel=3,
+            )
+            n_phi, n_x = max(n_phi, min_phi), max(n_x, min_x)
+        return n_phi, n_x
+
     def groove_path_on_surface(self):
         """Return wire groove centerlines as (x, phi) lists for visualization.
 
@@ -189,8 +231,12 @@ class CoilHolder:
     # STL export
     # ─────────────────────────────────────────────────────────────────────────
 
-    def to_stl_bytes(self, n_phi=720, n_x=400, include_flanges=True):
+    def to_stl_bytes(self, n_phi=None, n_x=None, include_flanges=True):
         """Generate binary STL of the holder as bytes.
+
+        n_phi, n_x : grid size.  None (default) sizes it from the groove radius
+        so the grooves stay continuous; coarser explicit values are raised to
+        the minimum (see ``export_grid``).
 
         Water-tight topology (every edge shared by exactly 2 triangles):
 
@@ -204,6 +250,7 @@ class CoilHolder:
           inner bore (full length through flanges)  ←→  flange end face inner ring
         """
         tri_arrays = []
+        n_phi, n_x = self.export_grid(n_phi, n_x)
         phi_g = np.linspace(-np.pi, np.pi, n_phi, endpoint=False)
         has_flanges = include_flanges and self.flange_w > 0
         x_flange = self.x_half + self.flange_w  # total half-length

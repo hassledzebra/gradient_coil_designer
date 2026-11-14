@@ -9,7 +9,7 @@ A universal Python toolkit for designing and fabricating MRI/NMR gradient coils 
 - **Target Field Method** stream-function computation for Gx, Gy, and Gz gradient axes
 - **Biot-Savart field verification** with linearity error reporting
 - **Concentric cylindrical holders** that stack inside each other — Gx (outermost) → Gy → Gz (innermost)
-- **Smooth half-pipe wire grooves** carved on the outer surface as a radial displacement / KD-tree distance field (no booleans → watertight, no slivers). The wire seats at the coil radius and is cradled by the groove walls
+- **Smooth half-pipe wire grooves** carved on the outer surface as a radial displacement / KD-tree distance field (no booleans → watertight, no slivers). The wire seats at the coil radius and is cradled by the groove walls. Export grids are sized from the groove radius (≥2 samples per groove radius, default 2.5, about 0.34 mm for 1.5 mm wire), so grooves stay continuous instead of printing as dotted lines; any coarser `n_phi`/`n_x` passed in is raised to that minimum with a warning
 - **Interactive GUI** (CustomTkinter dark theme) with tabbed matplotlib visualisation
 - **PyVista 3D** interactive GPU-accelerated rendering (optional)
 - **Exports**: binary STL, OBJ, CSV wire paths, Blender script, `.blend` file (headless)

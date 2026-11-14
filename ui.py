@@ -521,7 +521,7 @@ class App(ctk.CTk):
         try:
             for lbl, info in self._result["coils"].items():
                 p = os.path.join(d, f"{lbl}_holder.stl")
-                info["holder"].save_stl(p, n_phi=120, n_x=80)
+                info["holder"].save_stl(p)   # grid sized from the groove radius
                 self._log(f"STL: {p}")
             self._status.set(f"STL saved to {d}", color=_GREEN)
         except Exception as e:
